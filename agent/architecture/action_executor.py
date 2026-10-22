@@ -9,7 +9,7 @@ import time
 import uuid
 from typing import Any
 
-from .policy import ACTIONS
+from .actions import ACTIONS, operation_allows, validate_move_target, wrist_available
 
 
 class ActionExecutor:
@@ -144,15 +144,9 @@ class ActionExecutor:
         if "active_operation" not in world:
             return {"status": "rejected", "reason": "active-operation state is unknown"}
         external = world.get("active_operation")
-        if external is not None:
-            if not isinstance(external, dict) or external.get("status") not in (
-                "issuing", "running", "cancel_requested", "canceling", "unknown",
-                "succeeded", "failed", "canceled", "rejected",
-            ):
-                return {"status": "rejected", "reason": "active-operation state is malformed"}
-            if external.get("status") not in ("succeeded", "failed", "canceled", "rejected"):
-                return {"status": "rejected", "reason": "another controller reports an active operation",
-                        "active_operation": external}
+        if external is not None and not operation_allows(action, {"active_operation": external}):
+            return {"status": "rejected", "reason": "another controller reports an active operation",
+                    "active_operation": external}
         try:
             self._validate_action(action, decision, world)
         except (TypeError, ValueError, KeyError) as error:
@@ -188,62 +182,32 @@ class ActionExecutor:
                 self._finish("failed", f"could not send MOVE goal: {error}", world)
                 return {"status": "failed", "reason": str(error)}
             return {"status": "issuing", "operation": self.observation()}
-        operation["task"] = asyncio.create_task(self._run_operation(operation, decision, world))
+        operation["task"] = asyncio.create_task(self._run_service(operation, world))
         return {"status": "issuing", "operation": self.observation()}
 
     def _validate_action(self, action: str, decision: dict[str, Any], world: dict[str, Any]) -> None:
+        if action not in ACTIONS:
+            raise ValueError(f"unsupported action: {action!r}")
         if action == "MOVE":
-            robot = world.get("robot") if isinstance(world.get("robot"), dict) else {}
-            pose = robot.get("pose")
-            sources = world.get("sources") if isinstance(world.get("sources"), dict) else {}
-            pose_source = sources.get("robot_pose") if isinstance(sources.get("robot_pose"), dict) else {}
-            pose_age = _finite(robot.get("pose_age_s"), math.inf)
-            if (not isinstance(pose, dict) or pose_source.get("fresh", True) is not True
-                    or pose_age > self.pose_freshness_s
-                    or not all(math.isfinite(_finite(pose.get(key), math.nan)) for key in ("x", "y", "yaw"))):
-                raise ValueError("MOVE requires a fresh robot pose")
-            target = decision.get("target_pose")
-            if not isinstance(target, dict):
-                raise ValueError("MOVE requires target_pose")
-            x, y = _finite(target.get("x"), math.nan), _finite(target.get("y"), math.nan)
-            sine, cosine = _finite(target.get("sin"), math.nan), _finite(target.get("cos"), math.nan)
-            if not all(math.isfinite(value) for value in (x, y, sine, cosine)):
-                raise ValueError("MOVE target requires finite x, y, sin and cos")
-            arena = world.get("arena") if isinstance(world.get("arena"), dict) else {}
-            bounds = arena.get("bounds", arena)
-            if not isinstance(bounds, dict):
-                raise ValueError("arena bounds are unavailable")
-            if not (_finite(bounds.get("x_min"), 0.0) + self.robot_margin_m <= x <= _finite(bounds.get("x_max"), 3.0) - self.robot_margin_m
-                    and _finite(bounds.get("y_min"), 0.0) + self.robot_margin_m <= y <= _finite(bounds.get("y_max"), 2.0) - self.robot_margin_m):
-                raise ValueError("MOVE target lies outside the robot-center arena bounds")
-            if math.hypot(x - pose["x"], y - pose["y"]) < 1e-4:
-                raise ValueError("MOVE target is too close to the current position for the existing trajectory controller")
-            norm = math.hypot(sine, cosine)
-            if norm < 1e-6:
-                raise ValueError("MOVE target orientation vector has near-zero norm")
-        elif action.startswith("SUCTION_ALL_"):
-            if action not in ("SUCTION_ALL_ON", "SUCTION_ALL_OFF"):
-                raise ValueError("invalid grouped suction action")
-        elif action.startswith("SUCTION_"):
-            try:
-                index, state = action.removeprefix("SUCTION_").split("_")
-                if index not in ("1", "2", "3") or state not in ("ON", "OFF"):
-                    raise ValueError
-            except ValueError as error:
-                raise ValueError("invalid suction action") from error
+            validate_move_target(
+                world, decision.get("target_pose"), robot_margin_m=self.robot_margin_m,
+                pose_freshness_s=self.pose_freshness_s,
+            )
         elif action == "TOGGLE_WRIST":
-            robot = world.get("robot") if isinstance(world.get("robot"), dict) else {}
-            wrist = _finite(robot.get("wrist_angle_rad"), math.nan)
-            sources = world.get("sources") if isinstance(world.get("sources"), dict) else {}
-            wrist_source = sources.get("wrist") if isinstance(sources.get("wrist"), dict) else {}
-            if (not math.isfinite(wrist) or wrist_source.get("fresh", True) is not True
-                    or _finite(wrist_source.get("age_s"), math.inf) > 1.0):
+            if not wrist_available(world):
                 raise ValueError("TOGGLE_WRIST requires a fresh measured wrist angle")
-        else:
+        elif action in ("IDLE", "CANCEL"):
             raise ValueError(f"action {action} cannot start an operation")
 
-    async def _run_operation(self, operation: dict[str, Any], decision: dict[str, Any], world: dict[str, Any]) -> dict[str, Any]:
-        return await self._run_service(operation, decision, world)
+    def request_cancel_active_move(self, reason: str) -> bool:
+        """Request cancellation while keeping the operation locked until its terminal result."""
+        operation = self.active
+        if operation is None or operation.get("type") != "MOVE":
+            return False
+        operation["cancel_requested"] = True
+        operation["reason"] = reason
+        self._request_move_cancel(operation)
+        return True
 
     def _request_move_cancel(self, operation: dict[str, Any]) -> None:
         handle = operation.get("goal_handle")
@@ -298,7 +262,7 @@ class ActionExecutor:
             operation["status"] = "unknown"
             operation["reason"] = f"MOVE outcome uncertain: {error}"
 
-    async def _run_service(self, operation: dict[str, Any], decision: dict[str, Any], world: dict[str, Any]) -> dict[str, Any]:
+    async def _run_service(self, operation: dict[str, Any], world: dict[str, Any]) -> dict[str, Any]:
         from std_srvs.srv import SetBool
 
         action = operation["type"]
@@ -314,14 +278,11 @@ class ActionExecutor:
         else:
             client = self._wrist_client
             current = _finite(world.get("robot", {}).get("wrist_angle_rad"), math.nan)
-            if not math.isfinite(current):
-                return {"status": "failed", "reason": "wrist angle is unknown"}
             request = SetBool.Request()
             request.data = current < math.pi / 4.0
         if not client.service_is_ready():
             return {"status": "failed", "reason": f"service for {action} is unavailable"}
         try:
-            operation["terminal_kind"] = "service"
             operation["terminal_future"] = client.call_async(request)
             response = await _wait_ros_future(operation["terminal_future"], self.command_timeout_s)
         except asyncio.TimeoutError:
@@ -345,7 +306,7 @@ class ActionExecutor:
     async def close(self) -> None:
         operation = self.active
         if operation is not None and operation.get("type") == "MOVE":
-            operation["cancel_requested"] = True
+            self.request_cancel_active_move("runner stopped; canceling active MOVE")
             deadline = time.monotonic() + min(self.command_timeout_s, 2.0)
             while self.active is not None and time.monotonic() < deadline:
                 self._update_move(operation, self._last_world or {"sequence": operation["started_sequence"]})

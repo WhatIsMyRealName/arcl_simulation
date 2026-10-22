@@ -63,7 +63,7 @@ La ventouse de `arcl_simulation` illustre un service public au-dessus d’un bac
 - `src/arcl_simulation/launch/sim.launch.py`
 - `src/arcl_simulation/config/ros_bridge.yaml`
 - `src/arcl_simulation/worlds/arene_omni.sdf` et `src/ventouse_plugin/Ventouse.cc`
-- `src/arcl_simulation/test/test_ventouse_service.py` et `src/ventouse_plugin/test/ventouse_integration.cc`
+- `src/ventouse_plugin/test/ventouse_integration.cc`
 
 ## Revue finale
 

@@ -13,7 +13,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
-from ..architecture.policy import ACTIONS
+from ..architecture.actions import (
+    ACTIONS, DEFAULT_POSE_FRESHNESS_S, operation_allows,
+    validate_move_target, wrist_available,
+)
 from ..records import EpisodeRecords
 
 
@@ -105,7 +108,8 @@ class TwoRobotArenaEnv:
         controlled_robot_id: str,
         opponent_robot_id: str,
         episode_seconds: float = 90.0,
-        robot_margin_m: float = 0.20,
+        robot_margin_m: float | Mapping[str, float] = 0.20,
+        pose_freshness_s: float | Mapping[str, float] = DEFAULT_POSE_FRESHNESS_S,
         records_path: str | Path | None = "runs/episodes",
         gamma: float = 0.99,
         action_rewarder: RewardFunction | None = None,
@@ -117,12 +121,15 @@ class TwoRobotArenaEnv:
             raise ValueError("episode_seconds must be positive")
         if not math.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
             raise ValueError("gamma must be between zero and one")
-        if not math.isfinite(robot_margin_m) or robot_margin_m < 0.0:
-            raise ValueError("robot_margin_m must be finite and non-negative")
         self.advance = advance
         self.robot_ids = (controlled_robot_id, opponent_robot_id)
         self.episode_seconds = float(episode_seconds)
-        self.robot_margin_m = float(robot_margin_m)
+        self.robot_margins_m = _per_robot_setting(
+            robot_margin_m, self.robot_ids, "robot_margin_m", minimum=0.0, inclusive=True
+        )
+        self.pose_freshness_by_robot_s = _per_robot_setting(
+            pose_freshness_s, self.robot_ids, "pose_freshness_s", minimum=0.0, inclusive=False
+        )
         self.records_path = Path(records_path) if records_path is not None else None
         self.gamma = gamma
         self.records: EpisodeRecords | None = None
@@ -192,7 +199,10 @@ class TwoRobotArenaEnv:
         }
         policy_observations_before = self.agent_observations
         backend_actions = {
-            robot_id: _backend_action(actions[robot_id], self.observations[robot_id], self.robot_margin_m)
+            robot_id: _backend_action(
+                actions[robot_id], self.observations[robot_id], self.robot_margins_m[robot_id],
+                self.pose_freshness_by_robot_s[robot_id],
+            )
             for robot_id in self.robot_ids
         }
         self._record({"kind": "decision", "step": self.steps + 1,
@@ -406,67 +416,44 @@ def _score_map(world: dict[str, Any], robot_ids: tuple[str, str]) -> dict[str, f
     return None
 
 
-def _backend_action(action: dict[str, Any], observation: dict[str, Any], robot_margin_m: float = 0.20) -> dict[str, Any]:
+def _per_robot_setting(
+    value: float | Mapping[str, float], robot_ids: tuple[str, str], name: str,
+    *, minimum: float, inclusive: bool,
+) -> dict[str, float]:
+    supplied = value if isinstance(value, Mapping) else {robot_id: value for robot_id in robot_ids}
+    result: dict[str, float] = {}
+    for robot_id in robot_ids:
+        number = _number(supplied.get(robot_id), math.nan)
+        invalid_minimum = number < minimum if inclusive else number <= minimum
+        if not math.isfinite(number) or invalid_minimum:
+            relation = "non-negative" if inclusive else "positive"
+            raise ValueError(f"{name} for {robot_id} must be finite and {relation}")
+        result[robot_id] = number
+    return result
+
+
+def _backend_action(
+    action: dict[str, Any], observation: dict[str, Any], robot_margin_m: float = 0.20,
+    pose_freshness_s: float = DEFAULT_POSE_FRESHNESS_S,
+) -> dict[str, Any]:
     result = copy.deepcopy(action)
     if "world_sequence" in result and result["world_sequence"] != observation.get("sequence"):
         raise ValueError("decision is based on a stale observation sequence")
-    active = observation.get("active_operation")
-    if "active_operation" not in observation:
-        if result["action"] != "IDLE":
-            raise ValueError("active-operation state is unknown; only IDLE is valid")
-    elif isinstance(active, dict) and active.get("status") in ("issuing", "running", "cancel_requested", "canceling", "unknown"):
-        if active.get("type") == "MOVE" and active.get("cancelable") is True and active.get("status") in ("issuing", "running"):
-            if result["action"] not in ("IDLE", "CANCEL"):
-                raise ValueError("only IDLE or CANCEL is valid during an active move")
-        elif result["action"] != "IDLE":
-            raise ValueError("only IDLE is valid during a non-cancelable operation")
-    elif active is not None and (not isinstance(active, dict) or active.get("status") not in (
-        "succeeded", "failed", "canceled", "rejected"
-    )):
-        if result["action"] != "IDLE":
-            raise ValueError("active-operation state is unknown; only IDLE is valid")
-    elif result["action"] == "CANCEL":
-        raise ValueError("CANCEL requires an active cancelable move")
+    if result.get("action") not in ACTIONS:
+        raise ValueError(f"unsupported action: {result.get('action')!r}")
+    if not operation_allows(result["action"], observation):
+        reason = ("active-operation state is unknown; only IDLE is valid"
+                  if "active_operation" not in observation else
+                  f"action {result['action']} is not allowed during the current operation")
+        raise ValueError(reason)
     if result["action"] == "MOVE":
-        robot = observation.get("robot") if isinstance(observation.get("robot"), dict) else {}
-        pose = robot.get("pose")
-        sources = observation.get("sources") if isinstance(observation.get("sources"), dict) else {}
-        pose_source = sources.get("robot_pose") if isinstance(sources.get("robot_pose"), dict) else {}
-        if (not isinstance(pose, dict) or pose_source.get("fresh", True) is not True
-                or _number(robot.get("pose_age_s"), math.inf) > 0.75
-                or not all(math.isfinite(_number(pose.get(key), math.nan)) for key in ("x", "y", "yaw"))):
-            raise ValueError("MOVE requires a fresh robot pose")
-        target = result.get("target_pose")
-        if not isinstance(target, dict):
-            raise ValueError("MOVE requires an absolute target_pose")
-        x = _number(target.get("x"), math.nan)
-        y = _number(target.get("y"), math.nan)
-        sine = _number(target.get("sin"), math.nan)
-        cosine = _number(target.get("cos"), math.nan)
-        if not all(math.isfinite(value) for value in (x, y, sine, cosine)):
-            raise ValueError("MOVE target must contain finite x, y, sin and cos")
-        arena = observation.get("arena") if isinstance(observation.get("arena"), dict) else {}
-        bounds = arena.get("bounds", arena)
-        if not isinstance(bounds, dict):
-            raise ValueError("arena bounds are unavailable")
-        margin = robot_margin_m
-        if not (float(bounds.get("x_min", 0.0)) + margin <= x <= float(bounds.get("x_max", 3.0)) - margin
-                and float(bounds.get("y_min", 0.0)) + margin <= y <= float(bounds.get("y_max", 2.0)) - margin):
-            raise ValueError("MOVE target lies outside the robot-center arena bounds")
-        norm = math.hypot(sine, cosine)
-        if norm < 1e-6:
-            raise ValueError("MOVE target orientation vector has near-zero norm")
-        result["target_pose"] = {"x": x, "y": y, "sin": sine / norm, "cos": cosine / norm}
+        result["target_pose"] = validate_move_target(
+            observation, result.get("target_pose"), robot_margin_m=robot_margin_m,
+            pose_freshness_s=pose_freshness_s,
+        )
     elif result["action"] == "TOGGLE_WRIST":
-        robot = observation.get("robot") if isinstance(observation.get("robot"), dict) else {}
-        wrist = _number(robot.get("wrist_angle_rad"), math.nan)
-        sources = observation.get("sources") if isinstance(observation.get("sources"), dict) else {}
-        wrist_source = sources.get("wrist") if isinstance(sources.get("wrist"), dict) else {}
-        if (not math.isfinite(wrist) or wrist_source.get("fresh", True) is not True
-                or _number(wrist_source.get("age_s"), math.inf) > 1.0):
+        if not wrist_available(observation):
             raise ValueError("TOGGLE_WRIST requires a fresh measured wrist angle")
-    elif result["action"] not in ("IDLE", "CANCEL") and not result["action"].startswith("SUCTION_"):
-        raise ValueError(f"unsupported action: {result['action']!r}")
     if result["action"] != "MOVE":
         result.pop("target_pose", None)
     return result

@@ -46,6 +46,9 @@ stables : les IDs ArUco partagés ne sont pas des IDs de carton.
 Chaque ligne est un snapshot `schema_version: 2`, dans le repère absolu `map` :
 
 - `sequence`, `timestamp`, `arena.bounds` (`x_min`, `x_max`, `y_min`, `y_max`).
+- `observer_monotonic_s` est un temps monotone local utilisé par le runner pour
+  détecter les lignes bloquées dans le pipe ; l’observateur et le runner doivent
+  tourner sur la même machine.
 - `robot.pose` (`x`, `y`, `z`, `yaw`) estimée, `velocity` en `map`, leur âge,
   `wrist_angle_rad` et `suction_states` indexé de 1 à 3. Chaque champ facultatif
   peut rester inconnu lorsqu’aucune source valide ne l’a mesuré.
@@ -64,9 +67,10 @@ Chaque ligne est un snapshot `schema_version: 2`, dans le repère absolu `map` :
 - `zones` : listes de rectangles avec `id`, `center` ou `pose`, `yaw`, `length`,
   `width`, `capacity`, `occupied`, `release_allowed`, `accessible` et
   `approach_pose`. `yaw` tourne le rectangle dans le repère de l'arène.
-  Ces informations sont des observations pour le réseau, pas des conditions
-  imposées avant de commander un dépôt.
-- `mission` : `total_s` (90 par défaut), `remaining_s`, score et compteurs de cartons quand disponibles.
+  Ces champs restent descriptifs et ne sont pas encodés par la politique.
+- `mission` : `total_s` (90 s par défaut), `remaining_s`, score et compteurs de
+  cartons quand disponibles. L'observateur démarre le compte à rebours au premier
+  snapshot horodaté par `/clock`; le temps simulé s'arrête lorsque Gazebo est en pause.
 - `active_operation` et `last_action_result` : type, paramètres de déplacement,
   statut, échec et `cancelable`. Les retours exploités par la politique sont
   limités à ces statuts ; aucune progression d’exécution n’est encodée.
@@ -85,7 +89,10 @@ Chaque carton et obstacle reçoit un embedding 32D. Une attention à quatre têt
 conditionnée par le robot et le contexte, agrège les deux ensembles sans
 dépendre de l’ordre des entités ni tronquer leur nombre. Les inconnues gardent
 un indicateur de validité et leur âge lorsqu’il est mesuré. Les IDs et les
-détections ArUco ne sont pas des caractéristiques apprises.
+détections ArUco ne sont pas des caractéristiques apprises. La fraîcheur et
+l'âge des ensembles cartons et obstacles sont encodés même quand ils sont vides.
+Un `MOVE` reste autorisé lorsque la perception des obstacles est périmée ; cette
+incertitude est disponible comme caractéristique, pas comme filtre d'action.
 Les vitesses linéaires sont divisées par une échelle configurable
 (`--velocity-scale`, défaut 1 m/s), sans écrêtage. L’encodeur conserve les
 coordonnées absolues `map`; une pose inconnue masque `MOVE` sans bloquer les
@@ -94,14 +101,17 @@ autres décisions.
 ## Politique et exécution
 
 La politique possède une tête catégorielle, une tête gaussienne à quatre
-variables latentes pour le déplacement et une tête de valeur conservée pour
-compatibilité de checkpoint mais non utilisée par l’entraînement commun. Les variables
+variables latentes pour le déplacement et une tête de valeur dont les sorties
+sont enregistrées avec les décisions. L’entraînement commun ne l’optimise pas. Les variables
 `x,y` sont sigmoïdées dans les limites de la carte réduites par la marge robot
 (défaut 20 cm, configurable par `--robot-margin`) ; la sortie contient le couple
 `sin θ, cos θ`, normalisé puis décodé avec `atan2`. En collecte, la distribution
-d’action masquée utilisée au choix est journalisée pour préparer le self-play. Les checkpoints
-gardent l’étiquette v1 et sont chargés sans garde de version ; snapshots et
-épisodes sont versionnés séparément.
+d’action masquée utilisée au choix est journalisée pour préparer le self-play.
+Les checkpoints conservent la marge et la fraîcheur de pose utilisées au
+décodage. Sans option explicite, le runner et le trainer restaurent ces valeurs
+du checkpoint. Une substitution via `--robot-margin` ou `--pose-freshness` est
+signalée. Les formats de checkpoint inconnus sont refusés ; seuls les checkpoints
+v2 sont chargés.
 
 | Action | Commande et conditions |
 |---|---|
@@ -118,8 +128,19 @@ du serveur `/go_to_pose`. Un timeout demande l’annulation et conserve le verro
 `unknown` jusqu’au résultat terminal. `CANCEL` arrête les roues côté contrôleur,
 puis le serveur confirme l’annulation. Les services ventouse et poignet ne sont
 pas annulables. Aucun nouvel ordre n’est envoyé avant une fin confirmée.
-Le pas d’observation/décision live par défaut est 10 Hz. Garder la même marge
-dans le runner et l’environnement afin que le préfiltrage des cibles soit cohérent.
+Le runner, le trainer et le collecteur partagent le seuil de fraîcheur de pose
+du checkpoint ; le backend RL applique aussi ce seuil et la même distance
+minimale `MOVE` (0,1 mm). En self-play, chaque robot peut conserver les
+paramètres de son propre checkpoint.
+Le runner surveille le flux même lorsque `readline()` n'a reçu aucune ligne.
+Après `--snapshot-timeout` (1 s par défaut), il verrouille les décisions,
+demande l’annulation d’un `MOVE` et ne reprend qu'avec une pose fraîche et un
+résultat terminal confirmé.
+Le pas d’observation/décision live par défaut est 10 Hz. Après une seconde sans
+snapshot frais (`--snapshot-timeout`), le runner suspend les décisions, annule un
+`MOVE` actif et ne reprend qu'après une pose fraîche et un résultat terminal
+connu. L'horodatage monotone de l'observateur repère aussi les snapshots déjà
+accumulés dans le pipe.
 
 ## Déroulement d’un épisode RL
 
@@ -244,21 +265,30 @@ nulle. Les exemples self-play n’entraînent pas les paramètres continus de `M
 Elle consomme uniquement les cibles canoniques, applique l’entropie croisée à
 cibles souples aux logits et les pertes existantes de position/orientation
 quand `move_target_valid` est vrai. Le trainer ne lit ni retours, log-probabilités,
-avantages ni cibles de valeur. `train_policy` et `train_imitation` sont des alias
-vers cette même implémentation.
+avantages ni cibles de valeur.
 
 La séparation train/validation/test se fait par session ou épisode afin de ne
 pas répartir un même groupe entre partitions. Au moins deux groupes sont requis
 pour une séparation automatique ; les partitions explicites doivent être
 disjointes. Le fichier `.metrics.json` conserve les effectifs, sources,
-métriques d’action et erreurs de pose. Le checkpoint garde le format v1 et
-reste chargeable par `run_agent --model`.
+métriques d’action et erreurs de pose. Les checkpoints utilisent le format v2
+et restent chargeables par `run_agent --model`. Les anciens formats sont refusés.
+
+Le chargement des cibles vérifie leur compatibilité avec les masques de la
+politique avant tout entraînement et signale le fichier et la ligne fautive.
+Les métriques comprennent aussi les décisions prises sans opération en cours
+(`free_action_samples`, `free_expected_action_accuracy`), les effectifs par
+action et le nombre de cibles de déplacement. Une précision sans décision
+libre est `null`. Le critère de sélection reste la perte globale de validation.
+Si aucune époque n’améliore cette perte, les poids et le statut de la baseline
+sont conservés et le rapport indique `best_epoch: 0`. Le checkpoint de sortie
+est écrit après la boucle d’entraînement et l’évaluation finale.
 
 ## Limites volontairement conservées
 
-La caméra externe réelle, le backend de simulation RL, les sources fiables de
-charge/ventouse et la configuration des zones restent à raccorder. Le centrage
-vise environ 20 cm entre caméra et tag et ne garantit pas le contact physique.
-Les règles de points restent à définir. Les tests de flux utilisent un backend
-fictif et des récompenses locales au test, sans lancer ROS/Gazebo. Les commandes
-de lancement et d’entraînement sont regroupées dans [README.md](README.md).
+La caméra externe réelle, le backend de simulation RL et les règles de points
+restent hors périmètre. L'apprentissage actuel utilise les positions des cartons
+et les démonstrations `MOVE`/ventouses ; les zones ne sont volontairement pas
+encodées. Le centrage vise environ 20 cm entre caméra et tag et ne garantit pas
+le contact physique. Les commandes de lancement et d’entraînement sont regroupées
+dans [README.md](README.md).

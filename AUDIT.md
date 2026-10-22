@@ -1,6 +1,6 @@
 # Audit du dépôt
 
-Audit statique du dépôt, sans modification du code et sans exécution des tests. Les constats sont classés par nature; le point concernant la pause de la simulation est volontairement signalé comme peu important.
+Ce document recense uniquement les problèmes et les décisions restant à traiter. Les constats liés à l’agent figurent dans la seconde partie.
 
 ## Problèmes de paramétrage et de configuration
 
@@ -15,14 +15,6 @@ Référence : [sim.launch.py, ligne 44](src/arcl_simulation/launch/sim.launch.py
 - Le CMake de `robot_msgs` exige `action_msgs`, mais [son `package.xml`](src/robot_msgs/package.xml#L10) ne le déclare pas. L’installation des dépendances et l’ordre de compilation peuvent être incomplets dans un environnement propre.
 - Le launch d’`arcl_simulation` recherche et démarre le paquet `ros2_aruco`, mais [le `package.xml` du paquet](src/arcl_simulation/package.xml#L10) ne le déclare pas comme dépendance d’exécution. Le launch dépend également de `launch` et `ament_index_python`, importés dans le fichier launch sans dépendances d’exécution explicites.
 
-### Extensions d’outillage à déclarer dans les configurations de développement
-
-Les deux profils de devcontainer ajoutent des extensions VS Code via `customizations.vscode.extensions`. Les listes comprennent déjà `twxs.cmake` pour la prise en charge de CMake, `ms-vscode.cpptools` pour C/C++, ainsi que `ms-python.python` et `ms-python.autopep8` pour Python. Ce point concerne l’outillage de l’éditeur dans le conteneur : ces extensions apportent notamment coloration, navigation, complétion et assistance à l’édition, mais ne remplacent pas les dépendances ROS, les compilateurs ou les outils installés dans l’environnement.
-
-Les deux profils maintiennent des listes distinctes. Une extension ajoutée à un seul profil donnerait une expérience différente selon le conteneur Intel ou NVIDIA choisi. Les extensions de CMake, C/C++ et Python sont donc à considérer ensemble dans les deux configurations.
-
-Références : [devcontainer.json.intel](.devcontainer/devcontainer.json.intel#L27), [devcontainer.json.nvidia](.devcontainer/devcontainer.json.nvidia#L27).
-
 ## Problèmes de logique
 
 ### Les commandes de navigation et de centrage se disputent les roues
@@ -36,14 +28,6 @@ Références : [boucle et conversion des commandes](src/arcl_simulation/src/robo
 Les messages d’obstacle contiennent un rayon, mais la vérification de conflit compare uniquement la distance au centre avec `robot_radius`. Le calcul des points de détour utilise lui aussi `robot_radius + secu_marge`, sans ajouter le rayon de l’obstacle. Pour les obstacles larges, la trajectoire peut donc passer trop près ou entrer en collision.
 
 Références : [vérification des conflits](src/arcl_simulation/src/robot_control.cpp#L315), [génération du détour](src/arcl_simulation/src/robot_control.cpp#L351).
-
-### Le contact avec un obstacle empêche le robot d'atteindre sa position finale
-
-Le contrôleur suit une référence de position avec une correction proportionnelle, mais la fin du mouvement est décidée principalement à partir du temps calculé pour la trajectoire. Quand cette durée est atteinte, il marque l’objectif comme terminé et envoie une vitesse nulle, sans vérifier que la pose mesurée est suffisamment proche de la pose finale.
-
-Un carton peut donc ralentir ou bloquer le robot alors que le profil temporel continue d’avancer. Si le conflit est détecté sur la trajectoire, une nouvelle trajectoire est calculée périodiquement; cependant, cette reprise dépend de la détection et de la classification de l’obstacle, et ne vérifie pas à elle seule que le robot progresse ou finit par atteindre l’objectif. Le robot peut ainsi terminer sa commande avec une erreur de position restante.
-
-Références : [recalcul conditionnel de la trajectoire](src/arcl_simulation/src/robot_control.cpp#L294), [fin fondée sur la durée](src/arcl_simulation/src/robot_control.cpp#L415).
 
 ### Un objectif à la position actuelle peut produire des vitesses non finies
 
@@ -97,6 +81,36 @@ ros@fedora:/workspaces/arcl_simulation$
 ```
 Rien n'a changé entre les deux, la simulation était déja lancée depuis un moment, la seule chose qui s'est passée c'est que le robot s'est déplacé. Il faut voir si le problème est dû à la simulation gazebo (cartons contre le mur ou au milieu de la map) ou à autre chose.
 
-## Validation
+---
 
-Revue statique uniquement. Aucun test n’a été exécuté.
+## Revue de l’agent entraîné — état après corrections
+
+### Éléments encore à traiter
+
+#### AG-01 — P2 — Compléter les démonstrations de prise et de lâcher
+
+Il reste à enregistrer de nouvelles séquences valides de déplacement et de
+ventouses afin d’enrichir les groupes d’entraînement.
+
+#### AG-02 — P2 — Évaluer la politique sur des sessions indépendantes
+
+Il reste à constituer des jeux de validation et de test indépendants, puis à
+mesurer les prises, lâchers et parties réussis en boucle fermée avant de
+modifier le critère de sélection du checkpoint.
+
+#### AG-03 — P2 — Valider l’intégration de bout en bout dans ROS/Gazebo
+
+Il reste à faire un essai live couvrant fin de match, perte d’observations et
+commandes dans un workspace ROS/Gazebo configuré.
+
+### Décisions de périmètre
+
+- Les zones restent descriptives dans les snapshots et ne sont volontairement
+  pas encodées par le réseau. L’apprentissage par imitation utilise les positions
+  des cartons et les démonstrations `MOVE`/ventouses.
+- Le backend de self-play Gazebo et les fonctions de récompense ne sont pas inclus
+  dans ce chantier. Les données obtenues par imitation restent la voie
+  d’apprentissage retenue pour l’instant.
+- Les sources réelles de caméra externe, payload et contact confirmé ne sont pas
+  encore disponibles ; aucune valeur correspondante n’est déduite des états de
+  ventouse seuls.

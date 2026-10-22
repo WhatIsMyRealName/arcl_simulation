@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -10,21 +11,17 @@ import torch
 from torch import nn
 from torch.distributions import Categorical, Normal
 
-from .actions import ACTIONS
-from .world_encoder import (
-    CONTEXT_SIZE,
-    LEGACY_OPERATION_TYPES,
-    WorldEncoder,
+from .actions import (
+    ACTIONS, DEFAULT_POSE_FRESHNESS_S, action_mask, move_bounds,
 )
+from .world_encoder import CONTEXT_SIZE, WorldEncoder
 
 
-CHECKPOINT_FORMAT = "arcl-agent-policy-v1"
+CHECKPOINT_FORMAT = "arcl-agent-policy-v2"
 DEFAULT_CHECKPOINT_PATH = Path(__file__).resolve().parents[2] / "checkpoints" / "policy.pt"
 LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
 DEFAULT_ROBOT_MARGIN_M = 0.20
-
-
 class PolicyNetwork(nn.Module):
     """Shared observation encoder with categorical, continuous, and value heads."""
 
@@ -61,11 +58,15 @@ class AgentPolicy:
 
     def __init__(self, *, device: str = "cpu", robot_margin_m: float = DEFAULT_ROBOT_MARGIN_M,
                  velocity_scale_m_s: float = 1.0,
+                 pose_freshness_s: float = DEFAULT_POSE_FRESHNESS_S,
                  arena_bounds: tuple[float, float, float, float] = (0.0, 3.0, 0.0, 2.0)) -> None:
         self.device = torch.device(device)
         self.robot_margin_m = float(robot_margin_m)
         if not math.isfinite(self.robot_margin_m) or self.robot_margin_m < 0:
             raise ValueError("robot_margin_m must be finite and non-negative")
+        self.pose_freshness_s = float(pose_freshness_s)
+        if not math.isfinite(self.pose_freshness_s) or self.pose_freshness_s <= 0:
+            raise ValueError("pose_freshness_s must be finite and positive")
         self.velocity_scale_m_s = float(velocity_scale_m_s)
         self.arena_bounds = tuple(float(value) for value in arena_bounds)
         self.training_status = "untrained"
@@ -74,81 +75,57 @@ class AgentPolicy:
 
     def load_checkpoint(self, path: str | Path) -> None:
         checkpoint = torch.load(path, map_location=self.device, weights_only=True)
-        state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        if not isinstance(state_dict, dict):
-            raise ValueError("checkpoint must contain a policy state dictionary")
-        state_dict = self._expand_legacy_state_dict(state_dict)
-        self.training_status = (
-            checkpoint.get("training_status", "untrained")
-            if isinstance(checkpoint, dict) else "untrained"
-        )
-        configuration = checkpoint.get("observation_config") if isinstance(checkpoint, dict) else None
-        if isinstance(configuration, dict):
-            velocity_scale = _finite(configuration.get("velocity_scale_m_s"), math.nan)
-            bounds = configuration.get("arena_bounds")
-            if (math.isfinite(velocity_scale) and velocity_scale > 0 and isinstance(bounds, list)
-                    and len(bounds) == 4
-                    and all(math.isfinite(_finite(value, math.nan)) for value in bounds)):
-                normalized_bounds = tuple(float(value) for value in bounds)
-                if normalized_bounds[0] < normalized_bounds[1] and normalized_bounds[2] < normalized_bounds[3]:
-                    self.velocity_scale_m_s = velocity_scale
-                    self.arena_bounds = normalized_bounds
-                    self.network.encoder.velocity_scale_m_s = velocity_scale
-                    self.network.encoder.arena_bounds = normalized_bounds
-        self.network.load_state_dict(state_dict, strict=True)
+        if not isinstance(checkpoint, dict) or checkpoint.get("format") != CHECKPOINT_FORMAT:
+            found = checkpoint.get("format") if isinstance(checkpoint, dict) else type(checkpoint).__name__
+            raise ValueError(f"unsupported checkpoint format {found!r}; expected {CHECKPOINT_FORMAT}")
+        configuration = checkpoint["observation_config"]
+        if not isinstance(configuration, dict):
+            raise ValueError("checkpoint observation_config must be an object")
+        self.velocity_scale_m_s = float(configuration["velocity_scale_m_s"])
+        self.arena_bounds = tuple(float(value) for value in configuration["arena_bounds"])
+        self.robot_margin_m = float(configuration["robot_margin_m"])
+        self.pose_freshness_s = float(configuration["pose_freshness_s"])
+        if (len(self.arena_bounds) != 4 or not all(math.isfinite(value) for value in self.arena_bounds)
+                or self.arena_bounds[0] >= self.arena_bounds[1]
+                or self.arena_bounds[2] >= self.arena_bounds[3]
+                or not math.isfinite(self.velocity_scale_m_s) or self.velocity_scale_m_s <= 0
+                or not math.isfinite(self.robot_margin_m) or self.robot_margin_m < 0
+                or not math.isfinite(self.pose_freshness_s) or self.pose_freshness_s <= 0):
+            raise ValueError("checkpoint observation configuration is invalid")
+        self.network.encoder.velocity_scale_m_s = self.velocity_scale_m_s
+        self.network.encoder.arena_bounds = self.arena_bounds
+        self.network.load_state_dict(checkpoint["state_dict"], strict=True)
+        self.training_status = checkpoint["training_status"]
         self.network.eval()
 
-    def _expand_legacy_state_dict(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        expected = self.network.state_dict()
-        expanded = dict(state_dict)
-        output_weight = "action_head.2.weight"
-        output_bias = "action_head.2.bias"
-        for key in (output_weight, output_bias):
-            old = expanded.get(key)
-            new = expected.get(key)
-            if (isinstance(old, torch.Tensor) and isinstance(new, torch.Tensor)
-                    and old.shape != new.shape and old.ndim == new.ndim
-                    and old.shape[0] == len(LEGACY_OPERATION_TYPES)
-                    and old.shape[1:] == new.shape[1:]):
-                value = new.detach().clone()
-                value[:old.shape[0]].copy_(old)
-                expanded[key] = value
-
-        old_encoder = WorldEncoder(
-            velocity_scale_m_s=self.velocity_scale_m_s,
-            arena_bounds=self.arena_bounds,
-            operation_types=LEGACY_OPERATION_TYPES,
+    @classmethod
+    def from_checkpoint(
+        cls, path: str | Path | None, *, device: str = "cpu", create_if_missing: bool = False,
+        velocity_scale_m_s: float = 1.0,
+        robot_margin_m: float | None = None, pose_freshness_s: float | None = None,
+    ) -> tuple[AgentPolicy, bool]:
+        policy = cls(
+            device=device,
+            velocity_scale_m_s=velocity_scale_m_s,
+            robot_margin_m=DEFAULT_ROBOT_MARGIN_M if robot_margin_m is None else robot_margin_m,
+            pose_freshness_s=DEFAULT_POSE_FRESHNESS_S if pose_freshness_s is None else pose_freshness_s,
         )
-        old_context_names = old_encoder.feature_names["context"]
-        new_context_names = self.network.encoder.feature_names["context"]
-        for key, prefix_size in (
-            ("encoder.attention_query.0.weight", 32),
-            ("encoder.context_mlp.0.weight", 96),
-        ):
-            old = expanded.get(key)
-            new = expected.get(key)
-            if (not isinstance(old, torch.Tensor) or not isinstance(new, torch.Tensor)
-                    or old.shape == new.shape or old.ndim != 2 or new.ndim != 2
-                    or old.shape[0] != new.shape[0]
-                    or old.shape[1] != prefix_size + len(old_context_names)
-                    or new.shape[1] != prefix_size + len(new_context_names)):
-                continue
-            value = new.detach().clone()
-            value[:, :prefix_size].copy_(old[:, :prefix_size])
-            for old_index, feature_name in enumerate(old_context_names):
-                value[:, prefix_size + new_context_names.index(feature_name)].copy_(
-                    old[:, prefix_size + old_index]
-                )
-            expanded[key] = value
-        return expanded
-
-    def load_or_create_checkpoint(self, path: str | Path) -> bool:
+        if path is None:
+            return policy, False
         checkpoint_path = Path(path)
-        if checkpoint_path.is_file():
-            self.load_checkpoint(checkpoint_path)
-            return False
-        self.save_checkpoint(checkpoint_path)
-        return True
+        created = not checkpoint_path.is_file()
+        if created:
+            if not create_if_missing:
+                raise FileNotFoundError(checkpoint_path)
+            policy.save_checkpoint(checkpoint_path)
+        else:
+            policy.load_checkpoint(checkpoint_path)
+        for name, override in (("robot_margin_m", robot_margin_m), ("pose_freshness_s", pose_freshness_s)):
+            if override is not None:
+                if override != getattr(policy, name):
+                    warnings.warn(f"explicit {name} overrides checkpoint configuration", RuntimeWarning)
+                setattr(policy, name, float(override))
+        return policy, created
 
     def save_checkpoint(self, path: str | Path) -> None:
         checkpoint_path = Path(path)
@@ -158,75 +135,28 @@ class AgentPolicy:
             "observation_config": {
                 "velocity_scale_m_s": self.velocity_scale_m_s,
                 "arena_bounds": list(self.arena_bounds),
+                "robot_margin_m": self.robot_margin_m,
+                "pose_freshness_s": self.pose_freshness_s,
             },
             "training_status": self.training_status,
             "state_dict": self.network.state_dict(),
         }, checkpoint_path)
 
-    @staticmethod
-    def _pose_available(world: dict[str, Any]) -> bool:
-        robot = world.get("robot")
-        pose = robot.get("pose") if isinstance(robot, dict) else None
-        sources = world.get("sources") if isinstance(world.get("sources"), dict) else {}
-        source = sources.get("robot_pose") if isinstance(sources.get("robot_pose"), dict) else {}
-        age = _finite(robot.get("pose_age_s"), math.inf) if isinstance(robot, dict) else math.inf
-        if not isinstance(pose, dict) or source.get("fresh", True) is not True or age > 0.75:
-            return False
-        return all(math.isfinite(_finite(pose.get(key), math.nan)) for key in ("x", "y", "yaw"))
-
-    @staticmethod
-    def _wrist_available(world: dict[str, Any]) -> bool:
-        robot = world.get("robot")
-        if not isinstance(robot, dict) or not math.isfinite(_finite(robot.get("wrist_angle_rad"), math.nan)):
-            return False
-        sources = world.get("sources") if isinstance(world.get("sources"), dict) else {}
-        source = sources.get("wrist") if isinstance(sources.get("wrist"), dict) else {}
-        return source.get("fresh", True) is True and _finite(source.get("age_s"), math.inf) <= 1.0
-
-    @staticmethod
-    def _mask(world: dict[str, Any], device: torch.device) -> torch.Tensor:
-        mask = torch.zeros(len(ACTIONS), dtype=torch.bool, device=device)
-        operation = world.get("active_operation")
-        if "active_operation" not in world:
-            mask[ACTIONS.index("IDLE")] = True
-        elif operation is None:
-            mask[:] = True
-            mask[ACTIONS.index("CANCEL")] = False
-        elif isinstance(operation, dict) and operation.get("status") in ("issuing", "running"):
-            mask[ACTIONS.index("IDLE")] = True
-            if operation.get("cancelable") is True and operation.get("type") == "MOVE":
-                mask[ACTIONS.index("CANCEL")] = True
-        elif isinstance(operation, dict) and operation.get("status") in (
-            "succeeded", "failed", "canceled", "rejected"
-        ):
-            mask[:] = True
-            mask[ACTIONS.index("CANCEL")] = False
-        else:
-            mask[ACTIONS.index("IDLE")] = True
-        return mask
+    @classmethod
+    def valid_action_mask(
+        cls, world: dict[str, Any], device: torch.device,
+        pose_freshness_s: float = DEFAULT_POSE_FRESHNESS_S,
+    ) -> torch.Tensor:
+        return torch.tensor(action_mask(world, pose_freshness_s), dtype=torch.bool, device=device)
 
     def _distributions(self, world: dict[str, Any], output: dict[str, Any]) -> tuple[Categorical, Normal]:
-        mask = self._mask(world, self.device)
-        if not self._pose_available(world):
-            mask[ACTIONS.index("MOVE")] = False
-        if not self._wrist_available(world):
-            mask[ACTIONS.index("TOGGLE_WRIST")] = False
-        if not bool(mask.any()):
-            mask[ACTIONS.index("IDLE")] = True
+        mask = self.valid_action_mask(world, self.device, self.pose_freshness_s)
         action = Categorical(logits=output["action_logits"][0].masked_fill(~mask, -torch.inf))
         move = Normal(output["move_mean"][0], output["move_log_std"][0].exp())
         return action, move
 
     def _move_bounds(self, world: dict[str, Any]) -> tuple[float, float, float, float]:
-        arena = world.get("arena") if isinstance(world.get("arena"), dict) else {}
-        bounds = arena.get("bounds", arena) if isinstance(arena, dict) else {}
-        x_min = _finite(bounds.get("x_min"), 0.0) + self.robot_margin_m
-        x_max = _finite(bounds.get("x_max"), 3.0) - self.robot_margin_m
-        y_min = _finite(bounds.get("y_min"), 0.0) + self.robot_margin_m
-        y_max = _finite(bounds.get("y_max"), 2.0) - self.robot_margin_m
-        if x_min >= x_max or y_min >= y_max:
-            raise ValueError("arena is too small for the configured robot margin")
-        return x_min, x_max, y_min, y_max
+        return move_bounds(world, self.robot_margin_m)
 
     def decode_move_tensor(self, world: dict[str, Any], latent: torch.Tensor) -> torch.Tensor:
         x_min, x_max, y_min, y_max = self._move_bounds(world)

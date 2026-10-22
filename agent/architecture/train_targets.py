@@ -15,80 +15,76 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .policy import ACTIONS, DEFAULT_CHECKPOINT_PATH, AgentPolicy
-from .targets import TARGET_DATASET_FORMAT
-
-
-def _jsonl_files(paths: list[Path]) -> list[Path]:
-    files: set[Path] = set()
-    for path in paths:
-        if not path.exists():
-            raise ValueError(f"target dataset path does not exist: {path}")
-        if path.is_dir():
-            files.update(item.resolve() for item in path.rglob("*.jsonl"))
-        else:
-            files.add(path.resolve())
-    if not files:
-        raise ValueError("no canonical target JSONL files found")
-    return sorted(files)
+from .policy import (
+    ACTIONS,
+    DEFAULT_CHECKPOINT_PATH,
+    DEFAULT_POSE_FRESHNESS_S,
+    DEFAULT_ROBOT_MARGIN_M,
+    AgentPolicy,
+)
+from .targets import TARGET_DATASET_FORMAT, iter_jsonl
 
 
 def read_target_datasets(
     paths: list[Path],
+    *,
+    pose_freshness_s: float = DEFAULT_POSE_FRESHNESS_S,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
     groups: dict[str, list[dict[str, Any]]] = {}
     sample_ids: set[str] = set()
     source_counts: dict[str, int] = {}
-    for path in _jsonl_files(paths):
-        with path.open(encoding="utf-8") as stream:
-            for line_number, line in enumerate(stream, 1):
-                if not line.strip():
-                    continue
-                try:
-                    sample = json.loads(line)
-                except json.JSONDecodeError as error:
-                    raise ValueError(f"{path}:{line_number}: invalid JSON") from error
-                if not isinstance(sample, dict) or sample.get("format") != TARGET_DATASET_FORMAT:
-                    raise ValueError(
-                        f"{path}:{line_number}: expected canonical {TARGET_DATASET_FORMAT} sample; "
-                        "prepare raw demonstration/self-play records first"
-                    )
-                group_id = sample.get("group_id")
-                sample_id = sample.get("sample_id")
-                source = sample.get("source")
-                observation = sample.get("observation")
-                if not isinstance(group_id, str) or not group_id:
-                    raise ValueError(f"{path}:{line_number}: missing group_id")
-                if not isinstance(sample_id, str) or not sample_id:
-                    raise ValueError(f"{path}:{line_number}: missing sample_id")
-                if sample_id in sample_ids:
-                    raise ValueError(f"{path}:{line_number}: duplicate sample_id {sample_id!r}")
-                sample_ids.add(sample_id)
-                if not isinstance(source, str) or not source:
-                    raise ValueError(f"{path}:{line_number}: missing source metadata")
-                chosen_action = sample.get("chosen_action")
-                if chosen_action not in ACTIONS:
-                    raise ValueError(f"{path}:{line_number}: unsupported chosen_action {chosen_action!r}")
-                if not isinstance(observation, dict) or observation.get("schema_version") != 2:
-                    raise ValueError(f"{path}:{line_number}: expected observation schema v2")
-                probabilities = sample.get("target_action_probs")
-                _validate_distribution(probabilities, f"{path}:{line_number}")
-                move_valid = sample.get("move_target_valid")
-                target_pose = sample.get("target_move_pose")
-                if not isinstance(move_valid, bool):
-                    raise ValueError(f"{path}:{line_number}: move_target_valid must be boolean")
-                if move_valid:
-                    if not isinstance(target_pose, dict):
-                        raise ValueError(f"{path}:{line_number}: MOVE target pose is missing")
-                    if chosen_action != "MOVE":
-                        raise ValueError(f"{path}:{line_number}: pose target requires chosen_action MOVE")
-                    if probabilities[ACTIONS.index("MOVE")] <= 0.0:
-                        raise ValueError(f"{path}:{line_number}: pose target has no MOVE target mass")
-                    _validate_move_target(target_pose, path, line_number)
-                elif target_pose is not None:
-                    raise ValueError(f"{path}:{line_number}: masked MOVE pose target must be null")
-                groups.setdefault(group_id, []).append(sample)
-                source_counts[source] = source_counts.get(source, 0) + 1
+    for path, line_number, sample in iter_jsonl(paths, "target dataset"):
+        if not isinstance(sample, dict) or sample.get("format") != TARGET_DATASET_FORMAT:
+            raise ValueError(
+                f"{path}:{line_number}: expected canonical {TARGET_DATASET_FORMAT} sample; "
+                "prepare raw demonstration/self-play records first"
+            )
+        group_id = sample.get("group_id")
+        sample_id = sample.get("sample_id")
+        source = sample.get("source")
+        observation = sample.get("observation")
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError(f"{path}:{line_number}: missing group_id")
+        if not isinstance(sample_id, str) or not sample_id:
+            raise ValueError(f"{path}:{line_number}: missing sample_id")
+        if sample_id in sample_ids:
+            raise ValueError(f"{path}:{line_number}: duplicate sample_id {sample_id!r}")
+        sample_ids.add(sample_id)
+        if not isinstance(source, str) or not source:
+            raise ValueError(f"{path}:{line_number}: missing source metadata")
+        chosen_action = sample.get("chosen_action")
+        if chosen_action not in ACTIONS:
+            raise ValueError(f"{path}:{line_number}: unsupported chosen_action {chosen_action!r}")
+        if not isinstance(observation, dict) or observation.get("schema_version") != 2:
+            raise ValueError(f"{path}:{line_number}: expected observation schema v2")
+        probabilities = sample.get("target_action_probs")
+        _validate_distribution(probabilities, f"{path}:{line_number}")
+        mask = AgentPolicy.valid_action_mask(
+            observation, torch.device("cpu"), pose_freshness_s
+        )
+        incompatible = [action for index, action in enumerate(ACTIONS)
+                        if float(probabilities[index]) > 0.0 and not bool(mask[index])]
+        if incompatible:
+            raise ValueError(
+                f"{path}:{line_number}: target assigns probability to masked actions: "
+                + ", ".join(incompatible)
+            )
+        move_valid = sample.get("move_target_valid")
+        target_pose = sample.get("target_move_pose")
+        if not isinstance(move_valid, bool):
+            raise ValueError(f"{path}:{line_number}: move_target_valid must be boolean")
+        if move_valid:
+            if not isinstance(target_pose, dict):
+                raise ValueError(f"{path}:{line_number}: MOVE target pose is missing")
+            if chosen_action != "MOVE":
+                raise ValueError(f"{path}:{line_number}: pose target requires chosen_action MOVE")
+            if probabilities[ACTIONS.index("MOVE")] <= 0.0:
+                raise ValueError(f"{path}:{line_number}: pose target has no MOVE target mass")
+            _validate_move_target(target_pose, path, line_number)
+        elif target_pose is not None:
+            raise ValueError(f"{path}:{line_number}: masked MOVE pose target must be null")
+        groups.setdefault(group_id, []).append(sample)
+        source_counts[source] = source_counts.get(source, 0) + 1
     if not groups:
         raise ValueError("no prepared training targets found")
     return groups, source_counts
@@ -280,7 +276,7 @@ def evaluate(
     *,
     position_weight: float,
     orientation_weight: float,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     if not samples:
         raise ValueError("validation/test split contains no target samples")
     policy.network.eval()
@@ -288,6 +284,10 @@ def evaluate(
     move_distance = 0.0
     move_heading = 0.0
     move_count = 0
+    free_count = 0
+    free_accuracy = 0.0
+    action_counts = {action: 0 for action in ACTIONS}
+    action_accuracy = {action: 0.0 for action in ACTIONS}
     with torch.no_grad():
         for sample in samples:
             loss, _ = target_loss(policy, sample, class_weights,
@@ -299,6 +299,17 @@ def evaluate(
             target = sample["target_action_probs"]
             totals["loss"] += float(loss)
             totals["expected_action_accuracy"] += float(target[predicted_action])
+            chosen = sample["chosen_action"]
+            action_counts[chosen] += 1
+            action_accuracy[chosen] += float(target[predicted_action])
+            operation = sample["observation"].get("active_operation")
+            if "active_operation" in sample["observation"] and (
+                operation is None or isinstance(operation, dict) and operation.get("status") in (
+                    "succeeded", "failed", "canceled", "rejected"
+                )
+            ):
+                free_count += 1
+                free_accuracy += float(target[predicted_action])
             if sample["move_target_valid"]:
                 target_pose = sample["target_move_pose"]
                 prediction = policy.decode_move_tensor(sample["observation"], output["move_mean"][0])
@@ -312,28 +323,45 @@ def evaluate(
     metrics = {key: value / count for key, value in totals.items()}
     metrics["move_position_error_m"] = move_distance / move_count if move_count else 0.0
     metrics["move_heading_error_rad"] = move_heading / move_count if move_count else 0.0
+    metrics["move_samples"] = move_count
+    metrics["free_action_samples"] = free_count
+    metrics["free_expected_action_accuracy"] = free_accuracy / free_count if free_count else None
+    metrics["per_action"] = {
+        action: {"samples": count, "expected_action_accuracy": action_accuracy[action] / count}
+        for action, count in action_counts.items() if count
+    }
     return metrics
 
 
 def train(args: argparse.Namespace) -> dict[str, Any]:
-    groups, source_counts = read_target_datasets(args.datasets)
-    if args.validation_data:
-        training = groups
-        validation, _ = read_target_datasets(args.validation_data)
-    else:
-        training, validation = split_groups(groups, args.validation_fraction, args.seed)
-    test, _ = read_target_datasets(args.test_data) if args.test_data else ({}, {})
-    if set(training) & set(validation) or set(test) & (set(training) | set(validation)):
-        raise ValueError("train, validation and test groups must be disjoint")
-    if args.model is not None and not args.model.is_file():
-        raise ValueError(f"initial checkpoint does not exist: {args.model}")
-
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    policy = AgentPolicy(device=args.device)
-    if args.model is not None:
-        policy.load_checkpoint(args.model)
+    robot_margin_override = getattr(args, "robot_margin", None)
+    pose_freshness_override = getattr(args, "pose_freshness", None)
+    if args.model is not None and not args.model.is_file():
+        raise ValueError(f"initial checkpoint does not exist: {args.model}")
+    policy, _ = AgentPolicy.from_checkpoint(
+        args.model, device=args.device,
+        robot_margin_m=robot_margin_override, pose_freshness_s=pose_freshness_override,
+    )
+
+    groups, source_counts = read_target_datasets(
+        args.datasets, pose_freshness_s=policy.pose_freshness_s
+    )
+    if args.validation_data:
+        training = groups
+        validation, _ = read_target_datasets(
+            args.validation_data, pose_freshness_s=policy.pose_freshness_s
+        )
+    else:
+        training, validation = split_groups(groups, args.validation_fraction, args.seed)
+    test, _ = read_target_datasets(
+        args.test_data, pose_freshness_s=policy.pose_freshness_s
+    ) if args.test_data else ({}, {})
+    if set(training) & set(validation) or set(test) & (set(training) | set(validation)):
+        raise ValueError("train, validation and test groups must be disjoint")
+
     original_train_samples = _flatten(training)
     balanced_samples = balance_action_samples(original_train_samples, args.seed)
     train_samples = augment_length_symmetry(balanced_samples)
@@ -359,9 +387,13 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                           "learning_rate": args.learning_rate, "batch_size": args.batch_size,
                           "epochs": args.epochs, "device": args.device, **options},
     }
+    report["configuration"].update({
+        "robot_margin_m": policy.robot_margin_m,
+        "pose_freshness_s": policy.pose_freshness_s,
+    })
     best = baseline["loss"]
-    policy.training_status = "trained_targets"
-    policy.save_checkpoint(args.output)
+    best_state = copy.deepcopy(policy.network.state_dict())
+    best_status = policy.training_status
     for epoch in range(1, args.epochs + 1):
         policy.network.train()
         random.shuffle(train_samples)
@@ -384,10 +416,15 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         if metrics["validation"]["loss"] < best:
             best = metrics["validation"]["loss"]
             report["best_epoch"] = epoch
-            policy.save_checkpoint(args.output)
-    policy.load_checkpoint(args.output)
+            best_state = copy.deepcopy(policy.network.state_dict())
+            best_status = "trained_targets"
+    policy.network.load_state_dict(best_state)
+    policy.training_status = best_status
+    policy.network.eval()
     if test:
         report["test"] = evaluate(policy, _flatten(test), validation_weights, **options)
+    report["selected_training_status"] = best_status
+    policy.save_checkpoint(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.with_suffix(".metrics.json").write_text(
         json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
@@ -422,6 +459,10 @@ def main() -> None:
     parser.add_argument("--orientation-weight", type=float, default=1.0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--robot-margin", type=float,
+                        help="override checkpoint robot margin (default: checkpoint or 0.20 m)")
+    parser.add_argument("--pose-freshness", type=float,
+                        help="override checkpoint pose freshness (default: checkpoint or 0.75 s)")
     args = parser.parse_args()
     if (args.epochs < 1 or args.batch_size < 1 or not math.isfinite(args.learning_rate)
             or args.learning_rate <= 0.0):
@@ -431,9 +472,16 @@ def main() -> None:
         for value in (args.position_weight, args.orientation_weight)
     )):
         parser.error("invalid validation fraction or loss weights")
+    if ((args.robot_margin is not None
+         and (not math.isfinite(args.robot_margin) or args.robot_margin < 0.0))
+            or (args.pose_freshness is not None
+                and (not math.isfinite(args.pose_freshness) or args.pose_freshness <= 0.0))):
+        parser.error("robot margin must be non-negative and pose freshness must be positive")
     try:
         report = train(args)
-        print(f"saved best target-supervised checkpoint: {args.output} (epoch {report['best_epoch']})")
+        selection = (f"epoch {report['best_epoch']}" if report["best_epoch"]
+                     else "initial baseline retained; no epoch improved validation loss")
+        print(f"saved checkpoint: {args.output} ({selection})")
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         print(f"train_targets: {error}", file=sys.stderr)
         raise SystemExit(2) from error

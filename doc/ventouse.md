@@ -39,14 +39,13 @@ L'ancien topic booléen `/robot_omni/ventouse` est retiré. L'état Gazebo
 `/robot_omni/ventouse/etat` reste un diagnostic interne. Sur le robot réel, un pilote
 matériel peut remplacer le backend Gazebo en conservant le service public.
 
-## Tests
+## Test d’intégration du plugin
 
 Après compilation et chargement de `install/setup.bash` :
 
 ```bash
-colcon test --merge-install --packages-select arcl_simulation ventouse_plugin --ctest-args -R ventouse
-colcon test-result --all --verbose
+colcon test --merge-install --packages-select ventouse_plugin
 ```
 
-Les tests du service utilisent un backend ROS factice ; les tests du plugin lancent
-Gazebo sans interface graphique et vérifient contacts, liaisons, descente et pause.
+Ce test C++ lance Gazebo sans interface graphique et vérifie le comportement du
+plugin.

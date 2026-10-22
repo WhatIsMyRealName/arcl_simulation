@@ -578,7 +578,8 @@ class Interface:
         self.demo_idle_timer = None
         if self.recorder is None:
             return
-        if self.demo_active_operation is not None:
+        if (self.demo_active_operation is not None
+                and self.demo_active_operation.get('type') != 'UNSUPPORTED_ROCK_CENTERING'):
             self._record_choice('idle', {}, requires_result=False)
         self._schedule_demo_idle()
 
@@ -766,7 +767,8 @@ class Interface:
 
     # ------------------------------------------------------------------ commandes
     def envoyer(self, cle, valeur, libelle):
-        if self.en_cours:
+        if self.en_cours or self.action_en_cours:
+            self.ecrire('Attends la fin de l’opération en cours avant de commander la préhension', 'erreur')
             return
         self.en_cours = libelle
         if cle == 'poignet':
@@ -934,7 +936,8 @@ class Interface:
         self.dessiner_carte()
 
     def lancer_action(self, cle, champs, libelle):
-        if self.action_en_cours:
+        if self.action_en_cours or self.en_cours:
+            self.ecrire('Attends la fin de l’opération en cours avant de déplacer le robot', 'erreur')
             return
         self.action_en_cours = cle
         if cle == 'go_to_pose':

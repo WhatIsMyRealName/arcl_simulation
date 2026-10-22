@@ -163,7 +163,7 @@ class DemonstrationRecorder:
     def stop(self, *, reason: str = "operator stopped recording") -> None:
         del reason
         with self._lock:
-            if self._stopping or self._closed:
+            if self._closed:
                 return
             self._stopping = True
             if not self._pending:
@@ -184,11 +184,12 @@ class DemonstrationRecorder:
     def _finalize_locked(self) -> None:
         if self._closed:
             return
-        self._closed = True
         if not self._samples:
+            self._closed = True
             return
         if self.append_to_file:
             self._published_samples = append_target_samples(self.path, self._samples)
+            self._closed = True
             return
         temporary = self.destination / f".{self.session_id}.jsonl.tmp"
         try:
@@ -201,6 +202,7 @@ class DemonstrationRecorder:
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
             self._published_samples = len(self._samples)
+            self._closed = True
         except Exception:
             temporary.unlink(missing_ok=True)
             self._closed = False

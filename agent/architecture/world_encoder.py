@@ -8,16 +8,14 @@ from typing import Any
 import torch
 from torch import nn
 
+from .actions import ACTIONS
+
 
 EMBEDDING_SIZE = 32
 CONTEXT_SIZE = 64
 ENTITY_GROUPS = ("cartons", "obstacles")
 OBSERVATION_VERSION = 2
-LEGACY_OPERATION_TYPES = (
-    "IDLE", "CANCEL", "MOVE", "SUCTION_1_ON", "SUCTION_2_ON", "SUCTION_3_ON",
-    "SUCTION_1_OFF", "SUCTION_2_OFF", "SUCTION_3_OFF", "TOGGLE_WRIST",
-)
-OPERATION_TYPES = (*LEGACY_OPERATION_TYPES, "SUCTION_ALL_ON", "SUCTION_ALL_OFF")
+OPERATION_TYPES = ACTIONS
 
 
 def _object(value: Any) -> dict[str, Any]:
@@ -65,12 +63,10 @@ class WorldEncoder(nn.Module):
     """Encode map-frame robot state and unordered carton/obstacle sets."""
 
     def __init__(self, *, velocity_scale_m_s: float = 1.0,
-                 arena_bounds: tuple[float, float, float, float] = (0.0, 3.0, 0.0, 2.0),
-                 operation_types: tuple[str, ...] = OPERATION_TYPES) -> None:
+                 arena_bounds: tuple[float, float, float, float] = (0.0, 3.0, 0.0, 2.0)) -> None:
         super().__init__()
         self.velocity_scale_m_s = velocity_scale_m_s
         self.arena_bounds = arena_bounds
-        self.operation_types = tuple(operation_types)
         if not math.isfinite(self.velocity_scale_m_s) or self.velocity_scale_m_s <= 0:
             raise ValueError("velocity_scale_m_s must be finite and positive")
         if (len(arena_bounds) != 4 or not all(math.isfinite(value) for value in arena_bounds)
@@ -156,6 +152,15 @@ class WorldEncoder(nn.Module):
         mission = _object(world.get("mission"))
         for key in ("remaining_s", "score", "cartons_delivered", "cartons_remaining"):
             _put(row, key, mission.get(key), 90.0 if key == "remaining_s" else 1.0)
+        sources = _object(world.get("sources"))
+        for name in ("cartons", "obstacles"):
+            source = _object(sources.get(name))
+            _flag(row, f"{name}_source_fresh", source.get("fresh"))
+            source_age = _number(source.get("age_s"))
+            _put(row, f"{name}_source_age",
+                 None if source_age is None else min(2.0, max(0.0, source_age)), 2.0)
+            _category(row, f"{name}_source_status", source.get("status"),
+                      ("fresh", "stale", "error", "unknown", "invalid", "wrong_frame"))
         active = _object(world.get("active_operation"))
         last = _object(world.get("last_action_result"))
         statuses = ("idle", "issuing", "running", "cancel_requested", "canceling",
@@ -165,7 +170,7 @@ class WorldEncoder(nn.Module):
         for prefix, operation in (("active", active), ("last", last)):
             known_idle = prefix == "active" and active_is_idle
             _category(row, prefix + "_type", "IDLE" if known_idle else operation.get("type"),
-                      self.operation_types)
+                      OPERATION_TYPES)
             _category(row, prefix + "_status", "idle" if known_idle else operation.get("status"), statuses)
             _flag(row, prefix + "_failed", False if known_idle else operation.get("failed"))
             _flag(row, prefix + "_cancelable", False if known_idle else operation.get("cancelable"))

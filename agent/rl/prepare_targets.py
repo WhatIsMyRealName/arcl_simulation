@@ -15,48 +15,27 @@ from ..architecture.targets import (
     DEFAULT_TARGET_DATASET_PATH,
     TARGET_DATASET_FORMAT,
     append_target_samples,
+    iter_jsonl,
     selfplay_target_distribution,
 )
 from ..records import RECORD_SCHEMA_VERSION
 
 
-def _jsonl_files(paths: list[Path]) -> list[Path]:
-    files: set[Path] = set()
-    for path in paths:
-        if not path.exists():
-            raise ValueError(f"self-play record path does not exist: {path}")
-        if path.is_dir():
-            files.update(item.resolve() for item in path.rglob("*.jsonl"))
-        else:
-            files.add(path.resolve())
-    if not files:
-        raise ValueError("no self-play JSONL files found")
-    return sorted(files)
-
-
 def read_selfplay_episodes(paths: list[Path]) -> dict[str, list[dict[str, Any]]]:
     episodes: dict[str, list[dict[str, Any]]] = {}
     locations: dict[str, Path] = {}
-    for path in _jsonl_files(paths):
-        with path.open(encoding="utf-8") as stream:
-            for line_number, line in enumerate(stream, 1):
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as error:
-                    raise ValueError(f"{path}:{line_number}: invalid JSON") from error
-                if not isinstance(row, dict) or row.get("record_schema_version") != RECORD_SCHEMA_VERSION:
-                    raise ValueError(
-                        f"{path}:{line_number}: expected episode record schema v{RECORD_SCHEMA_VERSION}"
-                    )
-                episode_id = row.get("episode_id")
-                if not isinstance(episode_id, str):
-                    raise ValueError(f"{path}:{line_number}: missing episode_id")
-                if episode_id in locations and locations[episode_id] != path:
-                    raise ValueError(f"duplicate episode {episode_id!r} in multiple files")
-                locations[episode_id] = path
-                episodes.setdefault(episode_id, []).append(row)
+    for path, line_number, row in iter_jsonl(paths, "self-play record"):
+        if not isinstance(row, dict) or row.get("record_schema_version") != RECORD_SCHEMA_VERSION:
+            raise ValueError(
+                f"{path}:{line_number}: expected episode record schema v{RECORD_SCHEMA_VERSION}"
+            )
+        episode_id = row.get("episode_id")
+        if not isinstance(episode_id, str):
+            raise ValueError(f"{path}:{line_number}: missing episode_id")
+        if episode_id in locations and locations[episode_id] != path:
+            raise ValueError(f"duplicate episode {episode_id!r} in multiple files")
+        locations[episode_id] = path
+        episodes.setdefault(episode_id, []).append(row)
     return episodes
 
 

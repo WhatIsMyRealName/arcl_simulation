@@ -129,6 +129,7 @@ class Ventouse : public System, public ISystemConfigure, public ISystemPreUpdate
     gzmsg << "[Ventouse] " << this->bouches.size()
           << " ventouse(s) prête(s), commande sur " << topic << "\n";
     this->ok = true;
+    this->PublierEtat();
   }
 
   private: enum class Etat { LIBRE, ASPIRATION, TENU, DESCENTE };
@@ -209,7 +210,13 @@ class Ventouse : public System, public ISystemConfigure, public ISystemPreUpdate
   public: void PreUpdate(const UpdateInfo &_info, EntityComponentManager &_ecm) override
   {
     std::lock_guard<std::mutex> lock(this->mutex);
-    if (!this->ok || !this->operation)
+    if (!this->ok)
+      return;
+    const auto now = std::chrono::steady_clock::now();
+    if (this->dernierHeartbeat == std::chrono::steady_clock::time_point{} ||
+        now - this->dernierHeartbeat >= std::chrono::seconds(1))
+      this->PublierEtat();
+    if (!this->operation)
       return;
     if (std::chrono::steady_clock::now() >= this->operation->echeance)
     {
@@ -313,13 +320,25 @@ class Ventouse : public System, public ISystemConfigure, public ISystemPreUpdate
     return r;
   }
 
+  private: std::string EtatTexte() const
+  {
+    return this->etat == Etat::LIBRE ? "libre" :
+           this->etat == Etat::ASPIRATION ? "aspiration" :
+           this->etat == Etat::TENU ? "tenu" : "descente";
+  }
+
+  private: void PublierEtat()
+  {
+    msgs::StringMsg m;
+    m.set_data(this->EtatTexte());
+    this->pubEtat.Publish(m);
+    this->dernierHeartbeat = std::chrono::steady_clock::now();
+  }
+
   private: void ChangerEtat(Etat _e)
   {
     this->etat = _e;
-    msgs::StringMsg m;
-    m.set_data(_e == Etat::LIBRE ? "libre" : _e == Etat::ASPIRATION ? "aspiration" :
-               _e == Etat::TENU ? "tenu" : "descente");
-    this->pubEtat.Publish(m);
+    this->PublierEtat();
   }
 
   private: void Ascenseur(double _z)
@@ -440,6 +459,7 @@ class Ventouse : public System, public ISystemConfigure, public ISystemPreUpdate
   private: std::mutex mutex;
   private: std::optional<Operation> operation;
   private: Etat etat{Etat::LIBRE};
+  private: std::chrono::steady_clock::time_point dernierHeartbeat{};
   private: bool ok{false};
 };
 

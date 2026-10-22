@@ -7,7 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 from .actions import ACTIONS
 
@@ -15,6 +15,28 @@ from .actions import ACTIONS
 TARGET_DATASET_FORMAT = "arcl-agent-targets-v1"
 DEFAULT_SELFPLAY_STEP_SIZE = 0.1
 DEFAULT_TARGET_DATASET_PATH = Path("runs/targets.jsonl")
+
+
+def iter_jsonl(paths: Sequence[str | Path], label: str) -> Iterator[tuple[Path, int, dict[str, Any]]]:
+    files: set[Path] = set()
+    for value in paths:
+        path = Path(value)
+        if not path.exists():
+            raise ValueError(f"{label} path does not exist: {path}")
+        if path.is_dir():
+            files.update(item.resolve() for item in path.rglob("*.jsonl"))
+        else:
+            files.add(path.resolve())
+    if not files:
+        raise ValueError(f"no {label} JSONL files found")
+    for path in sorted(files):
+        with path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if line.strip():
+                    try:
+                        yield path, line_number, json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise ValueError(f"{path}:{line_number}: invalid JSON") from error
 
 
 def append_target_samples(path: str | Path, samples: Sequence[dict[str, Any]]) -> int:

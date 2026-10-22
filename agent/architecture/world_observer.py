@@ -87,6 +87,25 @@ def _source_status(
     }
 
 
+class MatchTimer:
+    """Count down from the first simulation-clock value observed by the publisher."""
+
+    def __init__(self, duration_s: float = 90.0) -> None:
+        if not math.isfinite(duration_s) or duration_s <= 0:
+            raise ValueError("match duration must be finite and positive")
+        self.duration_s = float(duration_s)
+        self.started_at_s: float | None = None
+        self.elapsed_s = 0.0
+
+    def remaining(self, sim_time_s: float | None) -> float | None:
+        if sim_time_s is None or not math.isfinite(sim_time_s):
+            return None
+        if self.started_at_s is None:
+            self.started_at_s = float(sim_time_s)
+        self.elapsed_s = max(self.elapsed_s, max(0.0, float(sim_time_s) - self.started_at_s))
+        return max(0.0, self.duration_s - self.elapsed_s)
+
+
 def _quaternion_matrix(quaternion: Mapping[str, Any]) -> np.ndarray:
     x, y, z, w = (float(quaternion[key]) for key in ("x", "y", "z", "w"))
     norm = math.sqrt(x * x + y * y + z * z + w * w)
@@ -261,9 +280,13 @@ class SnapshotAssembler:
         robot_pose = copy.deepcopy(self.pose.get("value")) if pose_meta["fresh"] and self.pose else None
         velocity = copy.deepcopy(self.velocity.get("value")) if velocity_meta["fresh"] and self.velocity else None
         wrist_angle = self.wrist.get("value") if wrist_meta["fresh"] and self.wrist else None
+        suction_meta = {
+            str(index): _source_status(self.suctions.get(str(index)), now, self.freshness["suction"])
+            for index in range(1, 4)
+        }
         suction_states = {
-            index: (sample.get("value") if _source_status(sample, now, self.freshness["suction"])["fresh"] else None)
-            for index, sample in self.suctions.items()
+            index: self.suctions[index]["value"] if suction_meta[index]["fresh"] else None
+            for index in self.suctions
         }
         obstacles = []
         if obstacle_meta["fresh"] and self.obstacles:
@@ -341,12 +364,9 @@ class SnapshotAssembler:
                 **{
                     f"suction_{index}": {
                         "topic": f"/robot_omni/ventouse_{index}/etat",
-                        "status": "unknown" if str(index) not in self.suctions else
-                            _source_status(self.suctions[str(index)], now, self.freshness["suction"])["status"],
-                        "fresh": str(index) in self.suctions and
-                            _source_status(self.suctions[str(index)], now, self.freshness["suction"])["fresh"],
-                        "age_s": None if str(index) not in self.suctions else
-                            _source_age(self.suctions[str(index)], now),
+                        "status": suction_meta[str(index)]["status"],
+                        "fresh": suction_meta[str(index)]["fresh"],
+                        "age_s": suction_meta[str(index)]["age_s"],
                     } for index in range(1, 4)
                 },
             },
@@ -591,6 +611,9 @@ def _run_ros(
             self.sequence = 0
             self.sim_time: float | None = None
             self.clock_received_at: float | None = None
+            self.match_timer = MatchTimer(args.match_duration_s)
+            self.warned_missing_clock = False
+            self.warned_stale_clock = False
             self.last_timestamp = 0.0
             self.logged_source_error: str | None = None
             clock_qos = QoSProfile(depth=1)
@@ -749,6 +772,27 @@ def _run_ros(
                 carton_source=carton_state,
                 clock_age_s=(None if self.clock_received_at is None else now - self.clock_received_at),
             )
+            remaining_s = self.match_timer.remaining(self.sim_time)
+            snapshot["mission"]["total_s"] = self.match_timer.duration_s
+            snapshot["mission"]["remaining_s"] = remaining_s
+            snapshot["observer_monotonic_s"] = now
+            clock_age_s = None if self.clock_received_at is None else now - self.clock_received_at
+            snapshot["sources"]["clock"] = {
+                "topic": "/clock",
+                "status": "unknown" if clock_age_s is None else ("stale" if clock_age_s > 2.0 else "fresh"),
+                "fresh": clock_age_s is not None and clock_age_s <= 2.0,
+                "age_s": clock_age_s,
+            }
+            if clock_age_s is None and now - self.started_at >= 2.0 and not self.warned_missing_clock:
+                self.get_logger().warning(
+                    "no /clock received; match countdown remains unknown and the live runner cannot time out"
+                )
+                self.warned_missing_clock = True
+            elif clock_age_s is not None and clock_age_s > 2.0 and not self.warned_stale_clock:
+                self.get_logger().warning(
+                    "/clock has not advanced recently; match countdown is paused until clock updates resume"
+                )
+                self.warned_stale_clock = True
             self.sequence += 1
             print(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False), flush=True)
 
@@ -773,6 +817,8 @@ def main() -> None:
     parser.add_argument("--map-config", default=str(DEFAULT_MAP))
     parser.add_argument("--robot-id", default="robot_omni")
     parser.add_argument("--publish-hz", type=float, default=10.0)
+    parser.add_argument("--match-duration-s", type=float, default=90.0,
+                        help="match countdown duration, measured in Gazebo simulation seconds")
     parser.add_argument("--carton-timeout", type=float, default=1.0)
     parser.add_argument("--association-radius", type=float, default=0.32)
     parser.add_argument("--association-margin", type=float, default=0.04)
@@ -781,6 +827,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.publish_hz <= 0:
         parser.error("--publish-hz must be positive")
+    if not math.isfinite(args.match_duration_s) or args.match_duration_s <= 0:
+        parser.error("--match-duration-s must be finite and positive")
     if args.association_radius <= 0 or args.association_margin < 0:
         parser.error("association radius must be positive and margin non-negative")
     if args.max_pose_marker_skew < 0:

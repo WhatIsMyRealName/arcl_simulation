@@ -2,6 +2,12 @@
 
 Toutes les commandes partent de la racine du dépôt.
 
+Installer les dépendances Python dans l’environnement utilisé pour l’agent :
+
+```sh
+python3 -m pip install -r agent/requirements.txt
+```
+
 ## Build et environnement ROS
 
 Dans un terminal, compiler le workspace :
@@ -68,23 +74,37 @@ source install/setup.bash
 ros2 run arcl_simulation strategy
 ```
 
-Les cibles sont ajoutées à `runs/targets.jsonl` à la fin de la stratégie.
+Les cibles sont ajoutées au chemin passé à `--records` (par défaut
+`runs/targets.jsonl`) à la fin de la stratégie.
 Les `IDLE` pendant les opérations sont gardés ; l’étape `IDLE` immédiate et le
 centrage sont ignorés. `gazebo_sim` utilise les poses Gazebo des cartons.
+
+Pour conserver les données brutes et repartir d'une copie excluant les deux
+exemples incompatibles revus dans le fichier local :
+
+```sh
+python3 -m agent.architecture.curate_targets runs/targets.jsonl \
+  --output runs/targets_curated.jsonl --exclude-line 411 --exclude-line 695
+```
+
+Enregistre ensuite les démonstrations corrigées avec
+`--records runs/targets_curated.jsonl`.
 
 ## Entraîner l’agent
 
 Dans un terminal, entraîner sur le fichier commun de cibles :
 
 ```sh
-python3 -m agent.architecture.train_targets runs/targets.jsonl \
+python3 -m agent.architecture.train_targets runs/targets_curated.jsonl \
   --output checkpoints/policy.pt --epochs 20
 ```
 Ajouter `--model checkpoints/policy.pt ` si on veut repartir d'un modèle déjà existant.
 
 Le découpage entraînement/validation se fait par session ou épisode ; il faut
-au moins deux groupes. Garde, déplace ou supprime `runs/targets.jsonl`
-manuellement selon que tu souhaites sauvegarder ou repartir de zéro.
+au moins deux groupes. Garde le fichier brut `runs/targets.jsonl` et réutilise
+la copie curatée pour les nouvelles démonstrations et l'entraînement. Les marges
+et seuils de fraîcheur sont sauvegardés dans le checkpoint ; `--robot-margin`
+et `--pose-freshness` les remplacent explicitement si besoin.
 
 À l’entraînement, chaque action présente dans le jeu d’entraînement est
 rééquilibrée au nombre d’exemples de l’action la plus fréquente en réutilisant
@@ -111,12 +131,27 @@ source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 python3 -m agent.architecture.world_observer --carton-source gazebo_sim \
   | python3 -m agent.architecture.run_agent \
-      --model checkpoints/policy.pt --records runs/live
+      --model checkpoints/policy.pt --records runs/live --snapshot-timeout 1.0
 ```
 
+L'observateur publie le temps restant en secondes de simulation dans
+`mission.remaining_s` (durée configurable avec `--match-duration-s`, 90 s par
+défaut). Le compte commence au premier snapshot horodaté par `/clock`. Si
+`/clock` est absent ou cesse d'avancer, le compte reste inconnu ou en pause et
+l'observateur émet un avertissement.
+
 `--sample-actions` active l’échantillonnage au lieu du choix déterministe. Les
+checkpoints absents sont créés avec des poids aléatoires ; un avertissement
+sur stderr signale que cette nouvelle politique n’a pas été entraînée.
+Les snapshots NDJSON sont limités à 4 Mio par ligne ; `--max-snapshot-bytes`
+permet d’adapter cette limite à un backend plus volumineux. Les
 journaux `runs/live` ne sont pas des cibles self-play : ils ne contiennent pas
 les récompenses par action.
+Le runner surveille le pipe indépendamment de l'arrivée des lignes, annule un
+`MOVE` si les observations s'interrompent et ne reprend qu'après une pose fraîche
+et un résultat terminal confirmé. Les zones restent descriptives : le modèle
+apprend sur la position des cartons et les démonstrations de déplacement et
+ventouses; le backend self-play n'est pas inclus.
 
 ## Self-play et préparation des cibles
 
@@ -157,11 +192,3 @@ python3 -m agent.architecture.train_targets runs/targets.jsonl \
 
 La préparation des cibles est une commande séparée après la collecte ;
 `--record-only` ne fournit pas les récompenses nécessaires.
-
-## Tests
-
-Dans un terminal à la racine du dépôt :
-
-```sh
-python3 -m unittest discover -s agent/tests -v
-```

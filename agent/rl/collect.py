@@ -12,7 +12,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..architecture.policy import AgentPolicy, DEFAULT_CHECKPOINT_PATH
+from ..architecture.policy import (
+    AgentPolicy,
+    DEFAULT_CHECKPOINT_PATH,
+)
 from .environment import TwoRobotArenaEnv, assign_action_points, assign_winner_points
 
 
@@ -26,8 +29,10 @@ def main() -> None:
     parser.add_argument("--records", type=Path, default=Path("runs/episodes"))
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--episode-seconds", type=float, default=90)
-    parser.add_argument("--robot-margin", type=float, default=0.20,
-                        help="map-boundary clearance for the robot center, in meters")
+    parser.add_argument("--robot-margin", type=float,
+                        help="override checkpoint map-boundary clearance, in meters")
+    parser.add_argument("--pose-freshness", type=float,
+                        help="override checkpoint robot-pose freshness, in seconds")
     parser.add_argument("--velocity-scale", type=float, default=1.0,
                         help="linear velocity feature scale in meters per second")
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -44,18 +49,27 @@ def main() -> None:
         torch.manual_seed(args.seed)
         module, factory = args.backend.split(":", 1)
         backend = getattr(importlib.import_module(module), factory)()
-        policy = AgentPolicy(device=args.device, robot_margin_m=args.robot_margin,
-                             velocity_scale_m_s=args.velocity_scale)
-        policy.load_or_create_checkpoint(args.model)
+        policy, created = AgentPolicy.from_checkpoint(
+            args.model, device=args.device, create_if_missing=True,
+            velocity_scale_m_s=args.velocity_scale, robot_margin_m=args.robot_margin,
+            pose_freshness_s=args.pose_freshness,
+        )
+        if created:
+            print(f"WARNING: checkpoint was absent; created randomly initialized policy at {args.model}. "
+                  "This policy has not been trained.", file=sys.stderr, flush=True)
         opponent = policy
         if args.opponent_model is not None:
-            opponent = AgentPolicy(device=args.device, robot_margin_m=args.robot_margin,
-                                   velocity_scale_m_s=args.velocity_scale)
-            opponent.load_checkpoint(args.opponent_model)
+            opponent, _ = AgentPolicy.from_checkpoint(
+                args.opponent_model, device=args.device, velocity_scale_m_s=args.velocity_scale,
+                robot_margin_m=args.robot_margin, pose_freshness_s=args.pose_freshness,
+            )
         env = TwoRobotArenaEnv(
             backend.advance, controlled_robot_id=args.robot_id, opponent_robot_id=args.opponent_id,
             episode_seconds=args.episode_seconds, records_path=args.records, gamma=args.gamma,
-            robot_margin_m=args.robot_margin,
+            robot_margin_m={args.robot_id: policy.robot_margin_m,
+                            args.opponent_id: opponent.robot_margin_m},
+            pose_freshness_s={args.robot_id: policy.pose_freshness_s,
+                              args.opponent_id: opponent.pose_freshness_s},
             action_rewarder=None if args.record_only else assign_action_points,
             terminal_rewarder=None if args.record_only else assign_winner_points,
         )
