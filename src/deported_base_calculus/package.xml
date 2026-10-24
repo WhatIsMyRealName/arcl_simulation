@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>camera_calculus</name>
+  <name>deported_base_calculus</name>
   <version>0.0.0</version>
   <description>TODO: Package description</description>
   <maintainer email="axelparis6@gmail.com">ros</maintainer>
@@ -13,6 +13,9 @@
   <test_depend>ament_lint_common</test_depend>
 
   <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2</depend>
+  <depend>visualization_msgs</depend>
   <depend>ros2_aruco_interfaces</depend>
 
   <export>

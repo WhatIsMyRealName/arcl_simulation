@@ -411,6 +411,18 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /deported_camera/image
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MarkerArray
+      Namespaces:
+        {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /deported_base_aruco_detected
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -436,7 +448,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 3.1353461742401123
+      Distance: 8.694561004638672
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -468,5 +480,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1430
-  X: 817
-  Y: 58
+  X: 490
+  Y: 32

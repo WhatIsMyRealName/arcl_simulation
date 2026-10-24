@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(camera_calculus)
+project(deported_base_calculus)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -8,13 +8,15 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp)
+find_package(geometry_msgs)
+find_package(tf2 REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(ros2_aruco_interfaces REQUIRED)
 
-
 add_executable(cam_tracking src/cam_tracking.cpp)
-ament_target_dependencies(cam_tracking rclcpp ros2_aruco_interfaces)
+ament_target_dependencies(cam_tracking rclcpp ros2_aruco_interfaces geometry_msgs tf2 visualization_msgs)
 
-install(TARGETS cam_tracking
+install(TARGETS cam_tracking 
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch config

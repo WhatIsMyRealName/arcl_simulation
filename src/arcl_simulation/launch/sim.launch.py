@@ -14,14 +14,17 @@ from launch.actions import ExecuteProcess
 def generate_launch_description():
     pkg_name = "arcl_simulation"
     pkg = get_package_share_directory(pkg_name)
+
     world = os.path.join(pkg, 'worlds', 'arene_omni.sdf')
+    world_camera = os.path.join(pkg, 'worlds', 'arene_omni_deported_base.sdf')
 
     with open(os.path.join(pkg, 'urdf', 'robot_omni.urdf')) as f:
         robot_description = f.read()
 
     gz = IncludeLaunchDescription(PythonLaunchDescriptionSource(
         os.path.join(get_package_share_directory('ros_gz_sim'), 'launch', 'gz_sim.launch.py')),
-        launch_arguments={'gz_args': [LaunchConfiguration('gz_flags'), ' ', world]}.items()
+        launch_arguments={'gz_args': f'-r {world}'}.items()
+        #launch_arguments={'gz_args': f'-r {world_camera}'}.items()
     )
 
     bridge = Node(
@@ -125,7 +128,7 @@ def generate_launch_description():
         AppendEnvironmentVariable('GZ_SIM_RESOURCE_PATH', os.path.join(pkg, 'worlds')),
         AppendEnvironmentVariable('GZ_SIM_RESOURCE_PATH',os.path.join(pkg, 'models')),
         gz, bridge, rsp, rviz, 
-        robot_control, rock_centering, table_markers,ventouse_service,
+        robot_control, rock_centering, table_markers, ventouse_service,
         wheel_odometry, otos_simulator, ekf_odom, beacon_localization,
         aruco_node,
         command_interface

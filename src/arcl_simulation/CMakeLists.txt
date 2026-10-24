@@ -58,7 +58,6 @@ install(DIRECTORY config launch rviz urdf worlds models
   DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
-  find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   # Skip linters which require source copyright headers that are not present yet.
   set(ament_cmake_copyright_FOUND TRUE)

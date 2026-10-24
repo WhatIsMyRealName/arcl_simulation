@@ -29,7 +29,7 @@ Version: 10/26/2020
 
 import rclpy
 import rclpy.node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from cv_bridge import CvBridge
 import numpy as np
 import cv2
@@ -152,8 +152,14 @@ class ArucoNode(rclpy.node.Node):
             CameraInfo, info_topic, self.info_callback, qos_profile_sensor_data
         )
 
+        # Reliable : en best effort les images 16 Mpx (~49 Mo) sont presque toutes perdues
+        image_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         self.create_subscription(
-            Image, image_topic, self.image_callback, qos_profile_sensor_data
+            Image, image_topic, self.image_callback, image_qos
         )
 
         # Set up publishers

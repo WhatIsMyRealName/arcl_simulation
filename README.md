@@ -16,21 +16,33 @@ source install/setup.bash
 ros2 launch arcl_simulation sim.launch.py
 ```
 
-## Commander le robot
+Le launch démarre Gazebo, RViz, les nœuds du robot et le **pupitre** de commande.
 
-**Aller à une position** (x, y en mètres) :
+## Pupitre
+
+Interface graphique (Tkinter) pour piloter le robot sans taper de commande : [move.launch.py](src/arcl_simulation/launch/move.launch.py). Elle est lancée automatiquement par `sim.launch.py`, mais peut aussi être ouverte seule :
 
 ```bash
-ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
-  "{header: {frame_id: map}, pose: {position: {x: 1.5, y: 1.0}, orientation: {z: 0.0, w: 1.0}}}"
+sudo apt install python3-tk   # une seule fois
+python3 src/arcl_simulation/launch/move.launch.py
 ```
 
-Ou avec l'outil **2D Goal Pose** de RViz.
+- **Ventouses** : les 3 étages ensemble ou un par un.
+- **Poignet** : 0° ou 90° (cartons debout).
+- **Aller à une pose** : clic sur la carte de la table pour la position, glisser pour l'orientation (envoie l'action `/go_to_pose`). Une nouvelle cible remplace la précédente.
+- **Centrage sur une pierre** : lance `/rock_centering` et affiche les erreurs en direct.
+- Affiche la position du robot (TF `map` → `base_link`), de l'ascenseur et du poignet (`/joint_states`).
 
-**Commander la vitesse directement** :
+Les actions en cours sont annulées à la fermeture de la fenêtre.
+
+## Commander le robot
+
+Le robot se commande uniquement par actions et services.
+
+**Aller à une pose** (x, y en mètres, theta en radians) :
 
 ```bash
-ros2 topic pub /speed_command robot_msgs/msg/RobotSpeed "{vx: 0.1, vy: 0.0, omega: 0.0}"
+ros2 action send_goal /go_to_pose robot_msgs/action/GoToPose "{x: 1.0, y: 1.0, theta: 1.57}" --feedback
 ```
 
 **Se centrer sur une pierre** (tag ArUco visible par la caméra) :
@@ -46,7 +58,28 @@ ros2 service call /robot_omni/ventouse/set std_srvs/srv/SetBool "{data: true}"  
 ros2 service call /robot_omni/ventouse/set std_srvs/srv/SetBool "{data: false}"  # lâcher
 ```
 
+Un seul étage : `/robot_omni/ventouse_<n>/set` (n = 1, 2, 3). Poignet : `/robot_omni/poignet/set` (`true` = 90°).
+
 Détails techniques : [compilation](doc/compilation.md) et [ventouses](doc/ventouse.md).
+
+## Stratégie
+
+Le nœud `strategy` ([strategy.cpp](src/arcl_simulation/src/strategy.cpp)) est une machine à état qui joue une séquence de match en enchaînant les actions et services ci-dessus. Il n'est pas lancé par `sim.launch.py` :
+
+```bash
+ros2 run arcl_simulation strategy                                   # côté jaune
+ros2 run arcl_simulation strategy --ros-args -p bleu:=true          # côté bleu (miroir x -> 3 - x)
+ros2 run arcl_simulation strategy --ros-args -p duree_match:=100.0  # arrêt au bout de 100 s
+```
+
+La séquence est une liste d'étapes écrite en dur dans `actions` :
+
+- `MOVE_TO` : `/go_to_pose` vers (x, y, theta en degrés).
+- `CENTRAGE` : `/rock_centering` sur la pile en (x, y). S'il réussit, le `MOVE_TO` suivant est remplacé par la pose corrigée.
+- `ROTATION_VENTOUSE` : poignet à 0° ou 90°.
+- `VENTOUSE` : prendre / lâcher, les 3 étages ou un seul.
+
+Chaque étape est rejouée en cas d'échec (2 essais), puis la séquence est abandonnée. `avance_apres_centrage` règle l'approche après le centrage (< 0 : calculée sur la carte, 0 : aucune, > 0 : avance fixe en m).
 
 ## Localisation
 
@@ -62,7 +95,16 @@ pose vraie ─────> otos_simulator ──> /otos/odom ──┘         
 - `ekf_odom` : `ekf_node` de robot_localization, fusionne les vitesses roues + OTOS dans le repère `odom` ([config/ekf_odom.yaml](src/arcl_simulation/config/ekf_odom.yaml)).
 - `beacon_localization` : EKF dans le repère `map`, prédiction avec `/odometry/filtered`, recalage sur les 3 balises vues au lidar.
 
-## Agent visuel
+## Calcul déporté (caméra fixe)
 
-Collecte ROS indépendante, caméra embarquée, commandes relatives et entraînement :
-[guide de l’agent](agent/docs/README.md).
+Une simulation de base du calcul déporté est disponible dans le paquet [deported_base_calculus](src/deported_base_calculus) (`camera_calculus`). Une caméra fixe sur un mât en bord de table (~1,8 m) publie son image sur `/deported_camera/image`, un `aruco_node` y détecte les tags et `cam_tracking` reçoit les marqueurs.
+
+```
+/deported_camera/image ──> aruco_node ──> /deported_aruco_markers ──> cam_tracking
+```
+
+```bash
+ros2 launch deported_base_calculus cam.launch.py   # avec la simulation déjà lancée
+```
+
+Pour l'instant `cam_tracking` se contente d'afficher le nombre de marqueurs détectés : c'est la base sur laquelle construire le suivi des robots et des éléments de jeu. Paramètres ArUco : [config/aruco_parameters.yaml](src/deported_base_calculus/config/aruco_parameters.yaml).

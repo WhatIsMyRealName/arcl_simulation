@@ -10,7 +10,7 @@
 -->
 <sdf version="1.9">
 <world name="arene_omni">
-  <physics name="1ms" type="ignored"><max_step_size>0.005</max_step_size><real_time_factor>1.0</real_time_factor></physics>
+  <physics name="1ms" type="ignored"><max_step_size>0.004</max_step_size><real_time_factor>1.0</real_time_factor></physics>
   <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
   <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
   <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
@@ -51,28 +51,6 @@
   <model name="obstacle1"><static>true</static><pose>1.5 1 0.25 0 0 0</pose><link name="link"><collision name="c"><geometry><cylinder><radius>0.05</radius><length>0.5</length></cylinder></geometry></collision><visual name="v"><geometry><cylinder><radius>0.05</radius><length>0.5</length></cylinder></geometry><material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse><specular>0.1 0.1 0.1 1</specular></material></visual></link></model>
   <model name="obstacle2"><static>true</static><pose>1.75 1 0.25 0 0 0</pose><link name="link"><collision name="c"><geometry><cylinder><radius>0.05</radius><length>0.5</length></cylinder></geometry></collision><visual name="v"><geometry><cylinder><radius>0.05</radius><length>0.5</length></cylinder></geometry><material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse><specular>0.1 0.1 0.1 1</specular></material></visual></link></model>
   -->
-  
-  <model name="camera_deportee">
-    <static>true</static>
-    <pose>0 0 0 0 0 0</pose>
-    <link name="camera_deportee">
-      <!-- Mât 4 x 4 cm, du sol (z = 0) à 1,84 m : son centre est à mi-hauteur -->
-      <visual name="mat"><pose>1.275 2.20 0.92 0 0 0</pose><geometry><box><size>0.04 0.04 1.84</size></box></geometry><material><ambient>0.95 0.95 0.95 1</ambient><diffuse>0.95 0.95 0.95 1</diffuse><specular>0.1 0.1 0.1 1</specular></material></visual>
-      <!-- Bras horizontal du mât jusqu'à la caméra -->
-      <visual name="bras"><pose>1.275 2.165 1.825 0 0 0</pose><geometry><box><size>0.03 0.07 0.02</size></box></geometry><material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse><specular>0.1 0.1 0.1 1</specular></material></visual>
-      <!-- Boîtier de la caméra, orienté comme le capteur -->
-      <visual name="cam_boitier"><pose>1.275 2.12 1.8 0 1.0297 -1.9338</pose><geometry><box><size>0.025 0.03 0.03</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse><specular>0.2 0.2 0.2 1</specular></material></visual>
-      <!-- Objectif : cylindre (axe Z) aligné sur l'axe optique, 2 cm devant le centre du boîtier -->
-      <visual name="cam_objectif"><pose>1.2713 2.1104 1.7829 0 2.6005 -1.9338</pose><geometry><cylinder><radius>0.008</radius><length>0.01</length></cylinder></geometry><material><ambient>0.05 0.05 0.2 1</ambient><diffuse>0.05 0.05 0.2 1</diffuse><specular>0.5 0.5 0.5 1</specular></material></visual>
-      <!-- Capteur : IMX519, 66° de champ horizontal (1.1519 rad), 4656 x 3496 px.
-           2 images/s suffisent (pierres immobiles) ; si le rendu est trop lourd : 2328 x 1748 (moitié, même champ).
-           camera_info est publié automatiquement sur /deported_camera/camera_info. -->
-      <sensor name="camera_deportee" type="camera"><pose>1.275 2.12 1.4 0 1.0297 -1.9338</pose><topic>/deported_camera/image</topic><gz_frame_id>camera_deportee_optical</gz_frame_id><update_rate>2</update_rate><always_on>true</always_on><visualize>false</visualize>
-        <camera><horizontal_fov>1.1519</horizontal_fov><image><width>4656</width><height>3496</height><format>R8G8B8</format></image><clip><near>0.05</near><far>10</far></clip><noise><type>gaussian</type><mean>0</mean><stddev>0.007</stddev></noise></camera>
-      </sensor>
-    </link>
-  </model>
-
 
 
   <!-- Pierres Eurobot 2027 : 10 carrières, chacune avec 3 pierres couchées empilées (plan G.1 du règlement BETA 0.4).

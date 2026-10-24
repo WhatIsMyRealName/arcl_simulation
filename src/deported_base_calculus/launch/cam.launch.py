@@ -5,7 +5,7 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    pkg_name = "camera_calculus"
+    pkg_name = "deported_base_calculus"
     pkg = get_package_share_directory(pkg_name)
 
     cam_tracking = Node(
@@ -27,5 +27,5 @@ def generate_launch_description():
 
     return LaunchDescription([
         cam_tracking,
-        aruco_node
+        aruco_node, 
     ])
