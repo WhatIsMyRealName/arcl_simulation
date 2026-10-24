@@ -99,10 +99,13 @@ def _outcome(world: dict[str, Any], robot_id: str, opponent_id: str | None) -> t
 
 
 async def _run(args: argparse.Namespace) -> int:
+    import torch
+    torch.set_num_threads(args.cpu_threads)
     policy, created = AgentPolicy.from_checkpoint(
         args.model, device=args.device, create_if_missing=True,
         velocity_scale_m_s=args.velocity_scale,
         robot_margin_m=args.robot_margin, pose_freshness_s=args.pose_freshness,
+        speed_linear_limit=args.speed_linear_limit, speed_angular_limit=args.speed_angular_limit,
     )
     if created:
         print(
@@ -117,6 +120,8 @@ async def _run(args: argparse.Namespace) -> int:
         pose_freshness_s=policy.pose_freshness_s,
         robot_margin_m=policy.robot_margin_m,
     )
+    executor.speed_linear_limit = policy.speed_linear_limit
+    executor.speed_angular_limit = policy.speed_angular_limit
     last_sequence: int | None = None
     last_timestamp: float | None = None
     records: EpisodeRecords | None = None
@@ -205,6 +210,9 @@ async def _run(args: argparse.Namespace) -> int:
                 if executor.last_result is not None:
                     world["last_action_result"] = executor.last_result
 
+                camera = world.get("front_camera") or {}
+                if camera.get("age_s") is not None:
+                    camera["age_s"] += _snapshot_age_s(world, time.monotonic())
                 decision = policy.decide(world, deterministic=not args.sample_actions)
                 execution = {"status": "dry_run"} if args.dry_run else await executor.dispatch(decision, world)
                 records.add({"kind": "decision", "agent_observations": {robot_id: world},
@@ -218,6 +226,7 @@ async def _run(args: argparse.Namespace) -> int:
                     "last_action_result": executor.last_result,
                 })
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                executor.stop_speed()
                 _emit({"error": str(error)})
     finally:
         if not read_task.done():
@@ -248,6 +257,9 @@ def main() -> None:
         default=DEFAULT_CHECKPOINT_PATH,
         help="checkpoint to load or create with random weights (default: %(default)s)",
     )
+    parser.add_argument("--speed-linear-limit", type=float, help="translation magnitude bound in m/s")
+    parser.add_argument("--speed-angular-limit", type=float, help="angular velocity bound in rad/s")
+    parser.add_argument("--cpu-threads", type=int, default=1, help="PyTorch CPU workers")
     parser.add_argument("--device", default="cpu", help="torch device, default: cpu")
     parser.add_argument("--command-timeout", type=float, default=35.0)
     parser.add_argument("--navigation-timeout", type=float, default=90.0)

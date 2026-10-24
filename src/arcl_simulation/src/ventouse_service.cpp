@@ -1,3 +1,4 @@
+#include "command_events.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -41,6 +42,7 @@ public:
 
   VentouseService() : Node("ventouse_service")
   {
+    command_events_ = CommandEvents::create_if_enabled(this);
     timeout_ = duree(declare_parameter("operation_timeout_sec", 2.0), "operation_timeout_sec");
     delai_lacher_ = duree(declare_parameter("delai_lacher", 1.2), "delai_lacher");
     duree_poignet_ = duree(declare_parameter("duree_poignet", 1.5), "duree_poignet");
@@ -130,10 +132,11 @@ private:
     return std::chrono::milliseconds(static_cast<int64_t>(std::ceil(s * 1000.0)));
   }
 
-  static void respond(const rclcpp::Service<SetBool>::SharedPtr & service, const std::shared_ptr<rmw_request_id_t> & header, bool success, const std::string & message){
+  void respond(const rclcpp::Service<SetBool>::SharedPtr & service, const std::shared_ptr<rmw_request_id_t> & header, bool success, const std::string & message){
     SetBool::Response response;
     response.success = success;
     response.message = message;
+    if (command_events_) command_events_->finish_request(header, success, message);
     service->send_response(*header, response);
   }
 
@@ -157,6 +160,7 @@ private:
   }
 
   void on_request(const rclcpp::Service<SetBool>::SharedPtr & service, std::shared_ptr<rmw_request_id_t> header, std::vector<int> etages, bool prendre){
+    if (command_events_) command_events_->begin_request(header, prendre, etages.size() == 3 ? "all" : std::to_string(etages.front() + 1), !rotation_ && !demande_);
     if (rotation_) {
       respond(service, header, false, "Poignet en mouvement, réessayer après");
       return;
@@ -230,6 +234,7 @@ private:
   }
 
   void on_poignet(std::shared_ptr<rmw_request_id_t> header, bool debout){
+    if (command_events_) command_events_->begin_request(header, debout, "wrist", !rotation_ && !demande_);
     if (rotation_) {
       respond(service_poignet_, header, false, "Poignet déjà en mouvement");
       return;
@@ -289,6 +294,7 @@ private:
     }
   }
 
+  std::unique_ptr<CommandEvents> command_events_;
   std::chrono::milliseconds timeout_{2000}, delai_lacher_{1200}, duree_poignet_{1500}, duree_montee_{400};
   double hauteur_{0.095}, hauteur_rotation_{0.12}, angle_poignet_{1.5708};
   std::string prefix_;

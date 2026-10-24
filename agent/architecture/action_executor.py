@@ -9,7 +9,7 @@ import time
 import uuid
 from typing import Any
 
-from .actions import ACTIONS, operation_allows, validate_move_target, wrist_available
+from .actions import ACTIONS, operation_allows, validate_move_target, wrist_available, validate_speed
 
 
 class ActionExecutor:
@@ -35,6 +35,12 @@ class ActionExecutor:
         self._spin_thread: threading.Thread | None = None
         self._owns_rclpy = False
         self._move_client: Any = None
+        self._speed_pub: Any = None
+        self._speed_timer: Any = None
+        self._speed_until = 0.0
+        self._speed_lock = threading.RLock()
+        self.speed_linear_limit = 0.25
+        self.speed_angular_limit = 1.0
         self._suction_clients: dict[int, Any] = {}
         self._suction_all_client: Any = None
         self._wrist_client: Any = None
@@ -48,6 +54,7 @@ class ActionExecutor:
         from rclpy.node import Node
         from rclpy.action import ActionClient
         from robot_msgs.action import GoToPose
+        from robot_msgs.msg import RobotSpeed
         from std_srvs.srv import SetBool
 
         self._rclpy = rclpy
@@ -55,6 +62,8 @@ class ActionExecutor:
             rclpy.init(args=None)
             self._owns_rclpy = True
         self._node = Node("arcl_agent_executor")
+        self._speed_pub = self._node.create_publisher(RobotSpeed, "/speed_command", 10)
+        self._speed_timer = self._node.create_timer(0.01, self._expire_speed)
         self._move_client = ActionClient(self._node, GoToPose, "/go_to_pose")
         self._suction_clients = {
             index: self._node.create_client(SetBool, f"/robot_omni/ventouse_{index}/set")
@@ -156,6 +165,16 @@ class ActionExecutor:
                 self.start()
             except (ImportError, RuntimeError) as error:
                 return {"status": "failed", "reason": f"ROS client unavailable: {error}"}
+        if action == "SPEED":
+            from robot_msgs.msg import RobotSpeed
+            values = validate_speed(world, decision.get("target_speed"), self.speed_linear_limit, self.speed_angular_limit)
+            msg = RobotSpeed()
+            msg.vx, msg.vy, msg.omega = (values[k] for k in ("vx", "vy", "omega"))
+            with self._speed_lock:
+                self._speed_until = time.monotonic() + 0.1
+                self._speed_pub.publish(msg)
+            return {"status": "running", "duration_s": 0.1, "target_speed": values}
+        self.stop_speed()
         operation_id = str(uuid.uuid4())
         is_move = action == "MOVE"
         operation = {
@@ -193,14 +212,29 @@ class ActionExecutor:
                 world, decision.get("target_pose"), robot_margin_m=self.robot_margin_m,
                 pose_freshness_s=self.pose_freshness_s,
             )
+        elif action == "SPEED":
+            validate_speed(world, decision.get("target_speed"), self.speed_linear_limit, self.speed_angular_limit)
         elif action == "TOGGLE_WRIST":
             if not wrist_available(world):
                 raise ValueError("TOGGLE_WRIST requires a fresh measured wrist angle")
         elif action in ("IDLE", "CANCEL"):
             raise ValueError(f"action {action} cannot start an operation")
 
+    def stop_speed(self) -> None:
+        with self._speed_lock:
+            if self._speed_pub is not None and self._speed_until:
+                from robot_msgs.msg import RobotSpeed
+                self._speed_pub.publish(RobotSpeed())
+            self._speed_until = 0.0
+
+    def _expire_speed(self) -> None:
+        with self._speed_lock:
+            if self._speed_until and time.monotonic() >= self._speed_until:
+                self.stop_speed()
+
     def request_cancel_active_move(self, reason: str) -> bool:
         """Request cancellation while keeping the operation locked until its terminal result."""
+        self.stop_speed()
         operation = self.active
         if operation is None or operation.get("type") != "MOVE":
             return False
@@ -304,6 +338,7 @@ class ActionExecutor:
         self.active = None
 
     async def close(self) -> None:
+        self.stop_speed()
         operation = self.active
         if operation is not None and operation.get("type") == "MOVE":
             self.request_cancel_active_move("runner stopped; canceling active MOVE")

@@ -11,7 +11,6 @@ from typing import Any
 
 import numpy as np
 
-RECORD_SCHEMA_VERSION = 2
 
 
 def _json_default(value: Any) -> Any:
@@ -40,7 +39,6 @@ class EpisodeRecords:
             raise RuntimeError("episode records are already finalized")
         self.rows.append(copy.deepcopy({
             **row, "episode_id": self.episode_id,
-            "record_schema_version": RECORD_SCHEMA_VERSION,
         }))
 
     def finish(self, *, complete: bool, winner_id: str | None,

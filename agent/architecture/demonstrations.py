@@ -136,6 +136,7 @@ class DemonstrationRecorder:
                 "target_action_probs": one_hot_action(action),
                 "target_move_pose": copy.deepcopy(target_move_pose),
                 "move_target_valid": target_move_pose is not None,
+                "speed_target_valid": False, "target_speed": None,
                 "source_command": command,
                 "source_parameters": copy.deepcopy(parameters or {}),
                 "result": None if requires_result else {"status": "not_applicable"},

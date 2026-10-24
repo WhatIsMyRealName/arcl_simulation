@@ -180,8 +180,9 @@ class RockCentering : public rclcpp::Node {
 
         void publish_speed(double vx, double vy, double omega) {
             robot_msgs::msg::RobotSpeed msg;
-            msg.vx = vx;
-            msg.vy = vy;
+            const double scale = std::max(1.0, std::hypot(vx, vy) / v_max_);
+            msg.vx = vx / scale;
+            msg.vy = vy / scale;
             msg.omega = omega;
             robot_speed_pub_->publish(msg);
         }

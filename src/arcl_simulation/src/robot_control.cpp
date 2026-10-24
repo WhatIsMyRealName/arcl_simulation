@@ -10,6 +10,7 @@
 #include "robot_msgs/action/go_to_pose.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 
+#include "command_events.hpp"
 #include <cmath>
 #include <algorithm>
 #include <vector>
@@ -57,6 +58,10 @@ class RobotControl : public rclcpp::Node{
                                 "/robot_omni/roue_4/cmd_vel", 10
                         ); // send control
 
+                        speed_linear_limit_ = declare_parameter("speed_linear_limit", 0.25);
+                        speed_angular_limit_ = declare_parameter("speed_angular_limit", 1.0);
+                        if (!std::isfinite(speed_linear_limit_) || speed_linear_limit_ <= 0 || !std::isfinite(speed_angular_limit_) || speed_angular_limit_ <= 0) throw std::invalid_argument("invalid speed limits");
+                        command_events_ = CommandEvents::create_if_enabled(this);
                         pose_action_server = rclcpp_action::create_server<robot_msgs::action::GoToPose>(
                                 this, "/go_to_pose",
                                 std::bind(&RobotControl::handle_goal, this, std::placeholders::_1, std::placeholders::_2),
@@ -98,26 +103,37 @@ class RobotControl : public rclcpp::Node{
         private:
 
 
+                std::unique_ptr<CommandEvents> command_events_;
+                bool speed_active_ = false;
+                double speed_linear_limit_, speed_angular_limit_;
+                std::chrono::steady_clock::time_point last_speed_;
                 std::shared_ptr<rclcpp_action::ServerGoalHandle<robot_msgs::action::GoToPose>> active_goal_pose_;
                 rclcpp_action::Server<robot_msgs::action::GoToPose>::SharedPtr pose_action_server;
                 rclcpp::Time start_time_;
 
-                rclcpp_action::GoalResponse handle_goal(const rclcpp_action::GoalUUID & /*uuid*/, std::shared_ptr<const robot_msgs::action::GoToPose::Goal> /*goal*/) {
-                        if (active_goal_pose_) {
+                rclcpp_action::GoalResponse handle_goal(const rclcpp_action::GoalUUID & uuid, std::shared_ptr<const robot_msgs::action::GoToPose::Goal> goal) {
+                        if (!std::isfinite(goal->x) || !std::isfinite(goal->y) || !std::isfinite(goal->theta) || active_goal_pose_ || !position_received || std::hypot(goal->x - x, goal->y - y) < 1e-4) {
+                                if (command_events_) command_events_->publish(CommandEvents::goal_id(uuid), "move", "rejected", "{}", "invalid goal or navigation busy");
                                 RCLCPP_WARN(get_logger(), "Goal pose rejected : already going somewhere");
                                 return rclcpp_action::GoalResponse::REJECT;
                         }
+                        speed_active_ = false;
+                        send_relative_robot_speed(0, 0, 0);
+                        if (command_events_) command_events_->move(uuid, goal->x, goal->y, goal->theta);
                         RCLCPP_INFO(get_logger(), "Goal pose received");
                         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
                 }
 
-                rclcpp_action::CancelResponse handle_cancel(const std::shared_ptr<rclcpp_action::ServerGoalHandle<robot_msgs::action::GoToPose>> /*goal_handle*/) {
+                rclcpp_action::CancelResponse handle_cancel(const std::shared_ptr<rclcpp_action::ServerGoalHandle<robot_msgs::action::GoToPose>> goal_handle) {
+                        if (command_events_) command_events_->cancel();
+                        (void)goal_handle;
                         RCLCPP_INFO(get_logger(), "Cancel goal pose requested");
                         return rclcpp_action::CancelResponse::ACCEPT;
                 }
 
                 void handle_accepted(const std::shared_ptr<rclcpp_action::ServerGoalHandle<robot_msgs::action::GoToPose>> goal_handle) {
                         active_goal_pose_ = goal_handle;
+                        if (command_events_) command_events_->navigation_id = CommandEvents::goal_id(goal_handle->get_goal_id());
                         
                         const auto goal = goal_handle->get_goal();
                         x_goal = goal->x;
@@ -476,6 +492,11 @@ class RobotControl : public rclcpp::Node{
 
                 rclcpp::TimerBase::SharedPtr control_timer_;
                 void trajectory_control_loop(){
+                        if (speed_active_ && std::chrono::steady_clock::now() - last_speed_ >= 200ms) {
+                                speed_active_ = false;
+                                send_relative_robot_speed(0, 0, 0);
+                                if (command_events_) command_events_->publish(command_events_->speed_id, "speed", "expired");
+                        }
                         if (active_goal_pose_ && active_goal_pose_->is_canceling()) {
                                 phase_finale = false;
                                 trajectoire_active = false;
@@ -484,7 +505,8 @@ class RobotControl : public rclcpp::Node{
                                 auto result = std::make_shared<robot_msgs::action::GoToPose::Result>();
                                 result->success = false;
                                 result->message = "Déplacement annulé";
-                                active_goal_pose_->canceled(result);
+                                if (command_events_) command_events_->publish(command_events_->navigation_id, "move", "canceled");
+                        active_goal_pose_->canceled(result);
                                 active_goal_pose_.reset();
                                 return;
                         }
@@ -626,6 +648,7 @@ class RobotControl : public rclcpp::Node{
                         auto result = std::make_shared<robot_msgs::action::GoToPose::Result>();
                         result->message = success ? "Objectif atteint" : "Timeout phase finale";
                         result->success = success;
+                        if (command_events_) command_events_->publish(command_events_->navigation_id, "move", success ? "succeeded" : "failed");
                         if (success) active_goal_pose_->succeed(result);
                         else active_goal_pose_->abort(result);
                         active_goal_pose_.reset();
@@ -640,7 +663,14 @@ class RobotControl : public rclcpp::Node{
 
                 rclcpp::Subscription<robot_msgs::msg::RobotSpeed>::SharedPtr robot_speed_sub_;
                 void robot_speed_callback(const robot_msgs::msg::RobotSpeed::SharedPtr robot_speed){
-                        send_relative_robot_speed(robot_speed->vx, robot_speed->vy, robot_speed->omega);
+                        const double vx = robot_speed->vx, vy = robot_speed->vy, omega = robot_speed->omega;
+                        const bool valid = std::isfinite(vx) && std::isfinite(vy) && std::isfinite(omega)
+                          && std::hypot(vx, vy) <= speed_linear_limit_ + 1e-7 && std::abs(omega) <= speed_angular_limit_ + 1e-7;
+                        if (command_events_) command_events_->speed(vx, vy, omega, valid, valid && !active_goal_pose_);
+                        if (!valid || active_goal_pose_) return;
+                        last_speed_ = std::chrono::steady_clock::now();
+                        speed_active_ = vx != 0 || vy != 0 || omega != 0;
+                        send_relative_robot_speed(vx, vy, omega);
                 }
                 
                 void send_relative_robot_speed(float vx_robot, float vy_robot, float omega_robot){

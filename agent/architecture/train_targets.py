@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
+import time
+from datetime import datetime, timezone
 import copy
 import json
 import math
@@ -29,6 +33,7 @@ def read_target_datasets(
     paths: list[Path],
     *,
     pose_freshness_s: float = DEFAULT_POSE_FRESHNESS_S,
+    speed_linear_limit: float = 0.25, speed_angular_limit: float = 1.0,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
     groups: dict[str, list[dict[str, Any]]] = {}
     sample_ids: set[str] = set()
@@ -55,8 +60,8 @@ def read_target_datasets(
         chosen_action = sample.get("chosen_action")
         if chosen_action not in ACTIONS:
             raise ValueError(f"{path}:{line_number}: unsupported chosen_action {chosen_action!r}")
-        if not isinstance(observation, dict) or observation.get("schema_version") != 2:
-            raise ValueError(f"{path}:{line_number}: expected observation schema v2")
+        if not isinstance(observation, dict):
+            raise ValueError(f"{path}:{line_number}: observation must be an object")
         probabilities = sample.get("target_action_probs")
         _validate_distribution(probabilities, f"{path}:{line_number}")
         mask = AgentPolicy.valid_action_mask(
@@ -83,6 +88,22 @@ def read_target_datasets(
             _validate_move_target(target_pose, path, line_number)
         elif target_pose is not None:
             raise ValueError(f"{path}:{line_number}: masked MOVE pose target must be null")
+        valid_speed = sample.get("speed_target_valid", False)
+        if not isinstance(valid_speed, bool):
+            raise ValueError(f"{path}:{line_number}: invalid speed_target_valid")
+        if valid_speed:
+            from .actions import validate_speed
+            if chosen_action != "SPEED":
+                raise ValueError("speed targets require SPEED")
+            validate_speed(observation, sample.get("target_speed"), speed_linear_limit, speed_angular_limit)
+        elif sample.get("target_speed") is not None:
+            raise ValueError("masked speed target must be null")
+        image = observation.get("front_camera") or {}
+        if image.get("path"):
+            image_path = Path(image['path'])
+            image['path'] = str((image_path if image_path.is_absolute() else path.parent / image_path).resolve())
+            from .vision import validate_image_reference
+            validate_image_reference(observation)
         groups.setdefault(group_id, []).append(sample)
         source_counts[source] = source_counts.get(source, 0) + 1
     if not groups:
@@ -205,11 +226,17 @@ def mirror_sample_along_length(sample: dict[str, Any]) -> dict[str, Any]:
             mirror_pose(operation.get("target_pose"))
 
     mirror_pose(mirrored.get("target_move_pose"))
+    speed = mirrored.get('target_speed')
+    if isinstance(speed, dict):
+        # Reflection of the world with heading pi-yaw preserves body forward and reverses lateral/yaw.
+        speed['vy'] = -speed['vy']
+        speed['omega'] = -speed['omega']
     return mirrored
 
 
 def augment_length_symmetry(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [*samples, *(mirror_sample_along_length(sample) for sample in samples)]
+    return [*samples, *(mirror_sample_along_length(sample) for sample in samples
+                        if not (sample['observation'].get('front_camera') or {}).get('path'))]
 
 
 def _class_weights(samples: list[dict[str, Any]], device: torch.device) -> torch.Tensor:
@@ -230,9 +257,10 @@ def target_loss(
     *,
     position_weight: float = 1.0,
     orientation_weight: float = 1.0,
+    output: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     observation = sample["observation"]
-    output = policy.network(observation)
+    output = policy.network(observation) if output is None else output
     action_distribution, _ = policy._distributions(observation, output)
     target = torch.tensor(sample["target_action_probs"], dtype=torch.float32, device=policy.device)
     log_probs = action_distribution.logits
@@ -262,11 +290,22 @@ def target_loss(
         orientation_loss = 1.0 - F.cosine_similarity(
             predicted_direction.unsqueeze(0), target_direction.unsqueeze(0), dim=-1, eps=1e-6
         )[0]
-    total = classification + position_weight * position_loss + orientation_weight * orientation_loss
+    speed_loss = output['action_logits'].new_zeros(())
+    if sample.get('speed_target_valid', False):
+        values = sample['target_speed']
+        target_speed = output['speed_mean'].new_tensor([values[k] for k in ('vx', 'vy', 'omega')])
+        bounds = target_speed.new_tensor([policy.speed_linear_limit, policy.speed_linear_limit, policy.speed_angular_limit])
+        speed_loss = F.smooth_l1_loss(policy.decode_speed_tensor(output['speed_mean'][0]) / bounds, target_speed / bounds)
+        magnitude = torch.linalg.vector_norm(target_speed[:2])
+        speed_loss = speed_loss + F.smooth_l1_loss(torch.sigmoid(output['speed_mean'][0, 0]), magnitude / policy.speed_linear_limit)
+        if float(magnitude) > 1e-6:
+            direction = torch.stack((target_speed[1], target_speed[0])) / magnitude
+            speed_loss = speed_loss + 1.0 - F.cosine_similarity(output['speed_mean'][0, 1:3], direction, dim=0)
+    total = classification + position_weight * position_loss + orientation_weight * orientation_loss + speed_loss
     if not torch.isfinite(total):
         raise ValueError("non-finite target-supervised loss")
     return total, {"classification": classification, "position": position_loss,
-                   "orientation": orientation_loss}
+                   "orientation": orientation_loss, "speed": speed_loss}
 
 
 def evaluate(
@@ -284,16 +323,18 @@ def evaluate(
     move_distance = 0.0
     move_heading = 0.0
     move_count = 0
+    speed_count = image_count = 0
+    speed_linear_error = speed_angular_error = 0.0
     free_count = 0
     free_accuracy = 0.0
     action_counts = {action: 0 for action in ACTIONS}
     action_accuracy = {action: 0.0 for action in ACTIONS}
     with torch.no_grad():
         for sample in samples:
-            loss, _ = target_loss(policy, sample, class_weights,
+            output = policy.network(sample["observation"])
+            loss, _ = target_loss(policy, sample, class_weights, output=output,
                                   position_weight=position_weight,
                                   orientation_weight=orientation_weight)
-            output = policy.network(sample["observation"])
             distribution, _ = policy._distributions(sample["observation"], output)
             predicted_action = int(distribution.probs.argmax())
             target = sample["target_action_probs"]
@@ -310,6 +351,14 @@ def evaluate(
             ):
                 free_count += 1
                 free_accuracy += float(target[predicted_action])
+            from .actions import image_available
+            image_count += int(image_available(sample['observation']))
+            if sample.get('speed_target_valid', False):
+                predicted_speed = policy.decode_speed_tensor(output['speed_mean'][0])
+                target_speed = sample['target_speed']
+                speed_linear_error += math.hypot(float(predicted_speed[0]) - target_speed['vx'], float(predicted_speed[1]) - target_speed['vy'])
+                speed_angular_error += abs(float(predicted_speed[2]) - target_speed['omega'])
+                speed_count += 1
             if sample["move_target_valid"]:
                 target_pose = sample["target_move_pose"]
                 prediction = policy.decode_move_tensor(sample["observation"], output["move_mean"][0])
@@ -323,6 +372,11 @@ def evaluate(
     metrics = {key: value / count for key, value in totals.items()}
     metrics["move_position_error_m"] = move_distance / move_count if move_count else 0.0
     metrics["move_heading_error_rad"] = move_heading / move_count if move_count else 0.0
+    metrics["speed_samples"] = speed_count
+    metrics["image_samples"] = image_count
+    metrics["image_availability"] = image_count / count
+    metrics["speed_linear_error_m_s"] = speed_linear_error / speed_count if speed_count else None
+    metrics["speed_angular_error_rad_s"] = speed_angular_error / speed_count if speed_count else None
     metrics["move_samples"] = move_count
     metrics["free_action_samples"] = free_count
     metrics["free_expected_action_accuracy"] = free_accuracy / free_count if free_count else None
@@ -341,27 +395,35 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     pose_freshness_override = getattr(args, "pose_freshness", None)
     if args.model is not None and not args.model.is_file():
         raise ValueError(f"initial checkpoint does not exist: {args.model}")
+    torch.set_num_threads(args.cpu_threads)
     policy, _ = AgentPolicy.from_checkpoint(
         args.model, device=args.device,
         robot_margin_m=robot_margin_override, pose_freshness_s=pose_freshness_override,
+        speed_linear_limit=args.speed_linear_limit, speed_angular_limit=args.speed_angular_limit,
     )
 
     groups, source_counts = read_target_datasets(
-        args.datasets, pose_freshness_s=policy.pose_freshness_s
+        args.datasets, pose_freshness_s=policy.pose_freshness_s,
+        speed_linear_limit=policy.speed_linear_limit, speed_angular_limit=policy.speed_angular_limit
     )
     if args.validation_data:
         training = groups
         validation, _ = read_target_datasets(
-            args.validation_data, pose_freshness_s=policy.pose_freshness_s
+            args.validation_data, pose_freshness_s=policy.pose_freshness_s,
+            speed_linear_limit=policy.speed_linear_limit, speed_angular_limit=policy.speed_angular_limit
         )
     else:
         training, validation = split_groups(groups, args.validation_fraction, args.seed)
     test, _ = read_target_datasets(
-        args.test_data, pose_freshness_s=policy.pose_freshness_s
+        args.test_data, pose_freshness_s=policy.pose_freshness_s,
+        speed_linear_limit=policy.speed_linear_limit, speed_angular_limit=policy.speed_angular_limit
     ) if args.test_data else ({}, {})
     if set(training) & set(validation) or set(test) & (set(training) | set(validation)):
         raise ValueError("train, validation and test groups must be disjoint")
 
+    run_directory = args.run_directory or Path('runs/training') / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')
+    run_directory.mkdir(parents=True, exist_ok=False)
+    started = time.monotonic()
     original_train_samples = _flatten(training)
     balanced_samples = balance_action_samples(original_train_samples, args.seed)
     train_samples = augment_length_symmetry(balanced_samples)
@@ -388,9 +450,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                           "epochs": args.epochs, "device": args.device, **options},
     }
     report["configuration"].update({
+        "speed_linear_limit": policy.speed_linear_limit, "speed_angular_limit": policy.speed_angular_limit,
         "robot_margin_m": policy.robot_margin_m,
         "pose_freshness_s": policy.pose_freshness_s,
     })
+    report['run_directory'] = str(run_directory)
+    report['datasets'] = [{'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+                          for values in (args.datasets, args.validation_data or [], args.test_data or [])
+                          for value in values for path in ([value] if value.is_file() else sorted(value.rglob('*.jsonl')))]
+    (run_directory / 'configuration.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
+    policy.save_checkpoint(run_directory / "best.pt")
     best = baseline["loss"]
     best_state = copy.deepcopy(policy.network.state_dict())
     best_status = policy.training_status
@@ -400,8 +469,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         for start in range(0, len(train_samples), args.batch_size):
             batch = train_samples[start:start + args.batch_size]
             optimizer.zero_grad(set_to_none=True)
-            losses = [target_loss(policy, sample, validation_weights, **options)[0]
-                      for sample in batch]
+            outputs = policy.network.forward_batch([sample['observation'] for sample in batch])
+            losses = [target_loss(policy, sample, validation_weights, output=output, **options)[0]
+                      for sample, output in zip(batch, outputs)]
             loss = torch.stack(losses).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.network.parameters(), 0.5)
@@ -412,12 +482,37 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "validation": evaluate(policy, validation_samples, validation_weights, **options),
         }
         report["epochs"].append(metrics)
-        print(json.dumps(metrics, separators=(",", ":")), flush=True)
+        linear = metrics["validation"]["speed_linear_error_m_s"]
+        angular = metrics["validation"]["speed_angular_error_rad_s"]
+        linear_text = f"{linear:.3f}" if linear is not None else "—"
+        angular_text = f"{angular:.3f}" if angular is not None else "—"
+        line = (f"Époque {epoch}/{args.epochs} | perte train {metrics['train']['loss']:.4f} | "
+                f"validation {metrics['validation']['loss']:.4f} | "
+                f"pose {metrics['validation']['move_position_error_m'] * 100:.2f} cm | "
+                f"vitesse {linear_text} m/s | "
+                f"rotation {angular_text} rad/s | "
+                f"précision attendue {metrics['validation']['expected_action_accuracy']:.1%} | "
+                f"meilleure {epoch if metrics['validation']['loss'] < best else report['best_epoch']} | "
+                f"{time.monotonic() - started:.1f} s")
+        print(line, flush=True)
+        with (run_directory / 'train.log').open('a') as log:
+            log.write(line + '\n')
+        with (run_directory / 'metrics.jsonl').open('a') as stream:
+            stream.write(json.dumps(metrics, allow_nan=False) + '\n')
+        flat = {'epoch': epoch, **{f'{split}_{key}': value for split in ('train', 'validation')
+                                  for key, value in metrics[split].items() if key != 'per_action'}}
+        with (run_directory / 'metrics.csv').open('a', newline='') as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(flat))
+            if epoch == 1:
+                writer.writeheader()
+            writer.writerow(flat)
         if metrics["validation"]["loss"] < best:
             best = metrics["validation"]["loss"]
             report["best_epoch"] = epoch
             best_state = copy.deepcopy(policy.network.state_dict())
             best_status = "trained_targets"
+            policy.training_status = best_status
+            policy.save_checkpoint(run_directory / "best.pt")
     policy.network.load_state_dict(best_state)
     policy.training_status = best_status
     policy.network.eval()
@@ -425,6 +520,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         report["test"] = evaluate(policy, _flatten(test), validation_weights, **options)
     report["selected_training_status"] = best_status
     policy.save_checkpoint(args.output)
+    policy.save_checkpoint(run_directory / "best.pt")
+    (run_directory / "metrics.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.with_suffix(".metrics.json").write_text(
         json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
@@ -447,6 +544,7 @@ def _finite(value: Any, default: float = 0.0) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("datasets", nargs="+", type=Path, help="canonical target JSONL files or directories")
+    parser.add_argument("--run-directory", type=Path, help="new training artifact directory")
     parser.add_argument("--model", type=Path, help="optional initial checkpoint")
     parser.add_argument("--output", type=Path, default=DEFAULT_CHECKPOINT_PATH)
     parser.add_argument("--validation-data", nargs="+", type=Path)
@@ -457,6 +555,9 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=0.0003)
     parser.add_argument("--position-weight", type=float, default=1.0)
     parser.add_argument("--orientation-weight", type=float, default=1.0)
+    parser.add_argument("--speed-linear-limit", type=float, help="translation magnitude bound in m/s")
+    parser.add_argument("--speed-angular-limit", type=float, help="angular velocity bound in rad/s")
+    parser.add_argument("--cpu-threads", type=int, default=1, help="PyTorch CPU workers")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--robot-margin", type=float,

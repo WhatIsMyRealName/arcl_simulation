@@ -1,4 +1,4 @@
-"""Versioned absolute-map observations encoded as permutation-invariant sets."""
+"""Absolute-map observations encoded as permutation-invariant sets."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from .actions import ACTIONS
 EMBEDDING_SIZE = 32
 CONTEXT_SIZE = 64
 ENTITY_GROUPS = ("cartons", "obstacles")
-OBSERVATION_VERSION = 2
 OPERATION_TYPES = ACTIONS
 
 
@@ -217,8 +216,6 @@ class WorldEncoder(nn.Module):
         return row
 
     def feature_dicts(self, world: dict[str, Any]) -> dict[str, Any]:
-        if world.get("schema_version") != OBSERVATION_VERSION:
-            raise ValueError(f"observation schema_version must be {OBSERVATION_VERSION}")
         bounds = self._bounds(world)
         robot = _object(world.get("robot"))
         pose = robot.get("pose")

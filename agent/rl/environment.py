@@ -15,7 +15,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 from ..architecture.actions import (
     ACTIONS, DEFAULT_POSE_FRESHNESS_S, operation_allows,
-    validate_move_target, wrist_available,
+    validate_move_target, wrist_available, validate_speed,
 )
 from ..records import EpisodeRecords
 
@@ -110,6 +110,8 @@ class TwoRobotArenaEnv:
         episode_seconds: float = 90.0,
         robot_margin_m: float | Mapping[str, float] = 0.20,
         pose_freshness_s: float | Mapping[str, float] = DEFAULT_POSE_FRESHNESS_S,
+        speed_linear_limit: float | Mapping[str, float] = 0.25,
+        speed_angular_limit: float | Mapping[str, float] = 1.0,
         records_path: str | Path | None = "runs/episodes",
         gamma: float = 0.99,
         action_rewarder: RewardFunction | None = None,
@@ -130,6 +132,8 @@ class TwoRobotArenaEnv:
         self.pose_freshness_by_robot_s = _per_robot_setting(
             pose_freshness_s, self.robot_ids, "pose_freshness_s", minimum=0.0, inclusive=False
         )
+        self.speed_linear_limits = _per_robot_setting(speed_linear_limit, self.robot_ids, "speed_linear_limit", minimum=0.0, inclusive=False)
+        self.speed_angular_limits = _per_robot_setting(speed_angular_limit, self.robot_ids, "speed_angular_limit", minimum=0.0, inclusive=False)
         self.records_path = Path(records_path) if records_path is not None else None
         self.gamma = gamma
         self.records: EpisodeRecords | None = None
@@ -202,6 +206,7 @@ class TwoRobotArenaEnv:
             robot_id: _backend_action(
                 actions[robot_id], self.observations[robot_id], self.robot_margins_m[robot_id],
                 self.pose_freshness_by_robot_s[robot_id],
+                self.speed_linear_limits[robot_id], self.speed_angular_limits[robot_id],
             )
             for robot_id in self.robot_ids
         }
@@ -306,7 +311,7 @@ class TwoRobotArenaEnv:
 
     @property
     def agent_observations(self) -> dict[str, dict[str, Any]]:
-        """Return the versioned map-frame observation for each policy."""
+        """Return the map-frame observation for each policy."""
         if self.observations is None:
             raise RuntimeError("call reset({world, observations}) before reading observations")
         return {
@@ -316,8 +321,6 @@ class TwoRobotArenaEnv:
 
     def _policy_observation(self, observation: dict[str, Any], robot_id: str) -> dict[str, Any]:
         result = copy.deepcopy(observation)
-        if result.get("schema_version") != 2:
-            raise ValueError("backend observations must use schema_version 2 map-frame inputs")
         if str(result.get("robot", {}).get("id")) != robot_id:
             raise ValueError(f"observation robot ID does not match {robot_id!r}")
         if not isinstance(result.get("mission"), dict):
@@ -435,6 +438,7 @@ def _per_robot_setting(
 def _backend_action(
     action: dict[str, Any], observation: dict[str, Any], robot_margin_m: float = 0.20,
     pose_freshness_s: float = DEFAULT_POSE_FRESHNESS_S,
+    speed_linear_limit: float = 0.25, speed_angular_limit: float = 1.0,
 ) -> dict[str, Any]:
     result = copy.deepcopy(action)
     if "world_sequence" in result and result["world_sequence"] != observation.get("sequence"):
@@ -451,6 +455,9 @@ def _backend_action(
             observation, result.get("target_pose"), robot_margin_m=robot_margin_m,
             pose_freshness_s=pose_freshness_s,
         )
+    elif result["action"] == "SPEED":
+        result["target_speed"] = validate_speed(observation, result.get("target_speed"), speed_linear_limit, speed_angular_limit)
+        result["duration_s"] = 0.1
     elif result["action"] == "TOGGLE_WRIST":
         if not wrist_available(observation):
             raise ValueError("TOGGLE_WRIST requires a fresh measured wrist angle")

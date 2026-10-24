@@ -17,7 +17,7 @@ from .actions import (
 from .world_encoder import CONTEXT_SIZE, WorldEncoder
 
 
-CHECKPOINT_FORMAT = "arcl-agent-policy-v2"
+CHECKPOINT_FORMAT = "arcl-agent-policy"
 DEFAULT_CHECKPOINT_PATH = Path(__file__).resolve().parents[2] / "checkpoints" / "policy.pt"
 LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
@@ -29,6 +29,11 @@ class PolicyNetwork(nn.Module):
                  arena_bounds: tuple[float, float, float, float] = (0.0, 3.0, 0.0, 2.0)) -> None:
         super().__init__()
         self.encoder = WorldEncoder(velocity_scale_m_s=velocity_scale_m_s, arena_bounds=arena_bounds)
+        from .vision import FrontCameraEncoder
+        self.camera_encoder = FrontCameraEncoder()
+        self.fusion = nn.Sequential(nn.Linear(CONTEXT_SIZE + 66, CONTEXT_SIZE), nn.Tanh())
+        self.speed_head = nn.Sequential(nn.Linear(CONTEXT_SIZE, 64), nn.Tanh(), nn.Linear(64, 4))
+        self.speed_log_std = nn.Parameter(torch.full((4,), -0.5))
         self.action_head = nn.Sequential(
             nn.Linear(CONTEXT_SIZE, 64), nn.Tanh(), nn.Linear(64, len(ACTIONS))
         )
@@ -42,15 +47,29 @@ class PolicyNetwork(nn.Module):
 
     def forward(self, world: dict[str, Any]) -> dict[str, Any]:
         context = self.encoder(world)["context"]
+        context = self.fusion(torch.cat((context, self.camera_encoder(world, context.device)), dim=-1))
         move_mean = self.move_mean_head(context)
         return {
             "action_logits": self.action_head(context),
             "move_mean": move_mean,
+            "speed_mean": self.speed_head(context),
+            "speed_log_std": self.speed_log_std.clamp(LOG_STD_MIN, LOG_STD_MAX),
             "move_log_std": self.move_log_std.clamp(LOG_STD_MIN, LOG_STD_MAX).expand_as(
                 move_mean
             ),
             "value": self.value_head(context).squeeze(-1),
         }
+
+
+    def forward_batch(self, worlds):
+        context = torch.cat([self.encoder(world)['context'] for world in worlds], dim=0)
+        context = self.fusion(torch.cat((context, self.camera_encoder.forward_many(worlds, context.device)), dim=-1))
+        outputs = {'action_logits': self.action_head(context), 'move_mean': self.move_mean_head(context),
+                   'speed_mean': self.speed_head(context), 'value': self.value_head(context).squeeze(-1)}
+        return [{**{key: value[index:index + 1] for key, value in outputs.items()},
+                 'move_log_std': self.move_log_std.clamp(LOG_STD_MIN, LOG_STD_MAX).unsqueeze(0),
+                 'speed_log_std': self.speed_log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)}
+                for index in range(len(worlds))]
 
 
 class AgentPolicy:
@@ -59,7 +78,12 @@ class AgentPolicy:
     def __init__(self, *, device: str = "cpu", robot_margin_m: float = DEFAULT_ROBOT_MARGIN_M,
                  velocity_scale_m_s: float = 1.0,
                  pose_freshness_s: float = DEFAULT_POSE_FRESHNESS_S,
-                 arena_bounds: tuple[float, float, float, float] = (0.0, 3.0, 0.0, 2.0)) -> None:
+                 arena_bounds: tuple[float, float, float, float] = (0.0, 3.0, 0.0, 2.0),
+                 speed_linear_limit: float = 0.25, speed_angular_limit: float = 1.0) -> None:
+        self.speed_linear_limit = float(speed_linear_limit)
+        self.speed_angular_limit = float(speed_angular_limit)
+        if any(not math.isfinite(v) or v <= 0 for v in (self.speed_linear_limit, self.speed_angular_limit)):
+            raise ValueError("speed bounds must be finite and positive")
         self.device = torch.device(device)
         self.robot_margin_m = float(robot_margin_m)
         if not math.isfinite(self.robot_margin_m) or self.robot_margin_m < 0:
@@ -81,6 +105,8 @@ class AgentPolicy:
         configuration = checkpoint["observation_config"]
         if not isinstance(configuration, dict):
             raise ValueError("checkpoint observation_config must be an object")
+        self.speed_linear_limit = float(configuration["speed_linear_limit"])
+        self.speed_angular_limit = float(configuration["speed_angular_limit"])
         self.velocity_scale_m_s = float(configuration["velocity_scale_m_s"])
         self.arena_bounds = tuple(float(value) for value in configuration["arena_bounds"])
         self.robot_margin_m = float(configuration["robot_margin_m"])
@@ -90,7 +116,8 @@ class AgentPolicy:
                 or self.arena_bounds[2] >= self.arena_bounds[3]
                 or not math.isfinite(self.velocity_scale_m_s) or self.velocity_scale_m_s <= 0
                 or not math.isfinite(self.robot_margin_m) or self.robot_margin_m < 0
-                or not math.isfinite(self.pose_freshness_s) or self.pose_freshness_s <= 0):
+                or not math.isfinite(self.pose_freshness_s) or self.pose_freshness_s <= 0
+                or any(not math.isfinite(v) or v <= 0 for v in (self.speed_linear_limit, self.speed_angular_limit))):
             raise ValueError("checkpoint observation configuration is invalid")
         self.network.encoder.velocity_scale_m_s = self.velocity_scale_m_s
         self.network.encoder.arena_bounds = self.arena_bounds
@@ -103,12 +130,15 @@ class AgentPolicy:
         cls, path: str | Path | None, *, device: str = "cpu", create_if_missing: bool = False,
         velocity_scale_m_s: float = 1.0,
         robot_margin_m: float | None = None, pose_freshness_s: float | None = None,
+        speed_linear_limit: float | None = None, speed_angular_limit: float | None = None,
     ) -> tuple[AgentPolicy, bool]:
         policy = cls(
             device=device,
             velocity_scale_m_s=velocity_scale_m_s,
             robot_margin_m=DEFAULT_ROBOT_MARGIN_M if robot_margin_m is None else robot_margin_m,
             pose_freshness_s=DEFAULT_POSE_FRESHNESS_S if pose_freshness_s is None else pose_freshness_s,
+            speed_linear_limit=0.25 if speed_linear_limit is None else speed_linear_limit,
+            speed_angular_limit=1.0 if speed_angular_limit is None else speed_angular_limit,
         )
         if path is None:
             return policy, False
@@ -120,10 +150,13 @@ class AgentPolicy:
             policy.save_checkpoint(checkpoint_path)
         else:
             policy.load_checkpoint(checkpoint_path)
-        for name, override in (("robot_margin_m", robot_margin_m), ("pose_freshness_s", pose_freshness_s)):
+        for name, override in (("robot_margin_m", robot_margin_m), ("pose_freshness_s", pose_freshness_s),
+                               ("speed_linear_limit", speed_linear_limit), ("speed_angular_limit", speed_angular_limit)):
             if override is not None:
                 if override != getattr(policy, name):
                     warnings.warn(f"explicit {name} overrides checkpoint configuration", RuntimeWarning)
+                if not math.isfinite(override) or override < 0 or (name != "robot_margin_m" and override == 0):
+                    raise ValueError(f"invalid {name}")
                 setattr(policy, name, float(override))
         return policy, created
 
@@ -133,6 +166,8 @@ class AgentPolicy:
         torch.save({
             "format": CHECKPOINT_FORMAT,
             "observation_config": {
+                "speed_linear_limit": self.speed_linear_limit,
+                "speed_angular_limit": self.speed_angular_limit,
                 "velocity_scale_m_s": self.velocity_scale_m_s,
                 "arena_bounds": list(self.arena_bounds),
                 "robot_margin_m": self.robot_margin_m,
@@ -173,6 +208,17 @@ class AgentPolicy:
         direction = torch.where(norm < 1e-6, fallback, normalized)
         return torch.stack((x, y, direction[..., 0], direction[..., 1]), dim=-1)
 
+    def decode_speed_tensor(self, latent: torch.Tensor) -> torch.Tensor:
+        # Latents: magnitude, sin(direction), cos(direction), angular velocity.
+        v = torch.sigmoid(latent[..., 0]) * self.speed_linear_limit
+        direction = latent[..., 1:3]
+        norm = torch.linalg.vector_norm(direction, dim=-1, keepdim=True)
+        fallback = torch.zeros_like(direction)
+        fallback[..., 1] = 1.0
+        direction = torch.where(norm < 1e-6, fallback, direction / norm.clamp_min(1e-12))
+        omega = torch.tanh(latent[..., 3]) * self.speed_angular_limit
+        return torch.stack((v * direction[..., 1], v * direction[..., 0], omega), dim=-1)
+
     def _decode_move(self, world: dict[str, Any], latent: torch.Tensor) -> dict[str, float]:
         decoded = self.decode_move_tensor(world, latent)
         x, y, sine, cosine = decoded.tolist()
@@ -195,6 +241,13 @@ class AgentPolicy:
             latent = torch.tensor(latent_values, dtype=torch.float32, device=self.device)
             log_prob = log_prob + move_dist.log_prob(latent).sum()
             entropy = entropy + move_dist.entropy().sum()
+        if action == "SPEED":
+            values = decision.get("behavior", {}).get("speed_latent", decision.get("speed_latent"))
+            if not isinstance(values, list) or len(values) != 4:
+                raise ValueError("SPEED requires four recorded latent samples")
+            dist = Normal(output["speed_mean"][0], output["speed_log_std"].exp())
+            log_prob = log_prob + dist.log_prob(torch.tensor(values, device=self.device)).sum()
+            entropy = entropy + dist.entropy().sum()
         return log_prob, entropy, output["value"][0]
 
     def evaluate_action(self, world: dict[str, Any], decision: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -216,8 +269,14 @@ class AgentPolicy:
                 latent_list = latent.tolist()
                 target = self._decode_move(world, latent)
                 decision.update({"target_pose": target, "move_latent": latent_list})
+            if action == "SPEED":
+                dist = Normal(output["speed_mean"][0], output["speed_log_std"].exp())
+                latent = dist.mean if deterministic else dist.sample()
+                decision["speed_latent"] = latent.tolist()
+                decision["target_speed"] = dict(zip(("vx", "vy", "omega"), self.decode_speed_tensor(latent).tolist()))
             log_prob, _, value = self._evaluate_output(world, decision, output)
             decision["behavior"] = {
+                **({"speed_latent": decision.pop("speed_latent")} if action == "SPEED" else {}),
                 "sampled": not deterministic,
                 "log_prob": float(log_prob),
                 "value": float(value),

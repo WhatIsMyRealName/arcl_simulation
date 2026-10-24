@@ -18,17 +18,14 @@ from ..architecture.targets import (
     iter_jsonl,
     selfplay_target_distribution,
 )
-from ..records import RECORD_SCHEMA_VERSION
 
 
 def read_selfplay_episodes(paths: list[Path]) -> dict[str, list[dict[str, Any]]]:
     episodes: dict[str, list[dict[str, Any]]] = {}
     locations: dict[str, Path] = {}
     for path, line_number, row in iter_jsonl(paths, "self-play record"):
-        if not isinstance(row, dict) or row.get("record_schema_version") != RECORD_SCHEMA_VERSION:
-            raise ValueError(
-                f"{path}:{line_number}: expected episode record schema v{RECORD_SCHEMA_VERSION}"
-            )
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}:{line_number}: episode record must be an object")
         episode_id = row.get("episode_id")
         if not isinstance(episode_id, str):
             raise ValueError(f"{path}:{line_number}: missing episode_id")
@@ -91,8 +88,6 @@ def prepare_episode_targets(
             action = decision.get("action")
             if action not in ACTIONS:
                 raise ValueError(f"episode {episode_id}: unsupported action {action!r}")
-            if observation.get("schema_version") != 2:
-                raise ValueError(f"episode {episode_id}: expected observation schema v2")
             behavior = decision.get("behavior")
             probabilities = behavior.get("action_probs") if isinstance(behavior, dict) else None
             if not isinstance(probabilities, list):
@@ -112,6 +107,8 @@ def prepare_episode_targets(
                 "target_action_probs": target_probs,
                 "target_move_pose": None,
                 "move_target_valid": False,
+                "speed_target_valid": False,
+                "target_speed": None,
                 "metadata": {
                     "episode_id": episode_id,
                     "robot_id": robot,

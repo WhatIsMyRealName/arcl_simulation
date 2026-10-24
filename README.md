@@ -61,3 +61,8 @@ pose vraie ─────> otos_simulator ──> /otos/odom ──┘         
 - `otos_simulator` : simule le SparkFun OTOS (erreur d'échelle, bruit, biais gyro, perte de suivi > 2,5 m/s). Paramètres réglables (`linear_scale_error`, `gyro_noise_density`, ...).
 - `ekf_odom` : `ekf_node` de robot_localization, fusionne les vitesses roues + OTOS dans le repère `odom` ([config/ekf_odom.yaml](src/arcl_simulation/config/ekf_odom.yaml)).
 - `beacon_localization` : EKF dans le repère `map`, prédiction avec `/odometry/filtered`, recalage sur les 3 balises vues au lidar.
+
+## Agent visuel
+
+Collecte ROS indépendante, caméra embarquée, commandes relatives et entraînement :
+[guide de l’agent](agent/docs/README.md).

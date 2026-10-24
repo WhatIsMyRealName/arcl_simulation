@@ -332,7 +332,6 @@ class SnapshotAssembler:
             "contact_target_id": None,
         }
         return {
-            "schema_version": 2,
             "sequence": int(sequence),
             "timestamp": float(timestamp),
             "game_time_s": float(timestamp),
@@ -590,7 +589,9 @@ def _run_ros(
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from robot_msgs.msg import ObstacleArray
         from ros2_aruco_interfaces.msg import ArucoMarkers
-        from sensor_msgs.msg import JointState
+        from sensor_msgs.msg import JointState, Image, CameraInfo
+        from cv_bridge import CvBridge, CvBridgeError
+        from rclpy.qos import qos_profile_sensor_data
         from std_msgs.msg import String
     except ImportError as error:
         raise RuntimeError(
@@ -600,6 +601,7 @@ def _run_ros(
     class WorldObserverNode(Node):
         def __init__(self) -> None:
             super().__init__("agent_world_observer")
+            self.telemetry_ready = False
             self.assembler = SnapshotAssembler(
                 map_config,
                 robot_id=args.robot_id,
@@ -607,6 +609,20 @@ def _run_ros(
                 association_margin_m=args.association_margin,
                 max_pose_marker_skew_s=args.max_pose_marker_skew,
             )
+            from .ros_sources import load_topics
+            import uuid
+            self.topics = load_topics(args.topics_config)
+            self.bridge = CvBridge()
+            self.image_directory = Path(args.image_directory or (Path("runs/observations") / str(uuid.uuid4()) / "images")).resolve()
+            self.image_directory.mkdir(parents=True, exist_ok=True)
+            self.latest_image = None
+            self.image_meta = None
+            self.camera_info = None
+            self.active_operation = None
+            self.last_action_result = None
+            self.create_subscription(Image, self.topics['image'], self.on_image, qos_profile_sensor_data)
+            self.create_subscription(CameraInfo, self.topics['camera_info'], self.on_camera_info, qos_profile_sensor_data)
+            self.create_subscription(String, self.topics['commands'], self.on_command, 100)
             self.started_at = time.monotonic()
             self.sequence = 0
             self.sim_time: float | None = None
@@ -618,18 +634,59 @@ def _run_ros(
             self.logged_source_error: str | None = None
             clock_qos = QoSProfile(depth=1)
             clock_qos.reliability = ReliabilityPolicy.BEST_EFFORT
-            self.create_subscription(PoseStamped, "/pose_estimation", self.on_pose, 10)
-            self.create_subscription(Odometry, "/odometry/filtered", self.on_velocity, 10)
-            self.create_subscription(JointState, "/joint_states", self.on_joint_states, 10)
-            self.create_subscription(ObstacleArray, "/obstacles_scan", self.on_obstacles, 10)
-            self.create_subscription(ArucoMarkers, "/aruco_markers", self.on_markers, 10)
-            self.create_subscription(Clock, "/clock", self.on_clock, clock_qos)
+            self.create_subscription(PoseStamped, self.topics["pose"], self.on_pose, 10)
+            self.create_subscription(Odometry, self.topics["velocity"], self.on_velocity, 10)
+            self.create_subscription(JointState, self.topics["joints"], self.on_joint_states, 10)
+            self.create_subscription(ObstacleArray, self.topics["obstacles"], self.on_obstacles, 10)
+            self.create_subscription(ArucoMarkers, self.topics["markers"], self.on_markers, 10)
+            self.create_subscription(Clock, self.topics["clock"], self.on_clock, clock_qos)
             for index in range(1, 4):
                 self.create_subscription(
-                    String, f"/robot_omni/ventouse_{index}/etat",
+                    String, self.topics[f"suction_{index}"],
                     lambda message, actuator=index: self.on_actuator_suction(actuator, message), 10,
                 )
             self.create_timer(1.0 / args.publish_hz, self.on_timer)
+
+        def on_image(self, message):
+            self.latest_image = (message, time.monotonic())
+
+        def on_camera_info(self, message):
+            self.camera_info = {"frame_id": message.header.frame_id, "width": message.width,
+                                "height": message.height, "k": list(message.k), "d": list(message.d)}
+
+        def on_command(self, message):
+            from .capture import operation_event
+            try:
+                event = json.loads(message.data)
+                self.active_operation, self.last_action_result = operation_event(
+                    event, self.active_operation, self.last_action_result)
+            except (ValueError, KeyError, TypeError):
+                self.get_logger().warning("invalid command event")
+
+        def attach_image(self, snapshot, now):
+            from PIL import Image as PILImage
+            snapshot['front_camera'] = {"path": None, "valid": False, "age_s": None}
+            if self.latest_image is None:
+                return
+            message, received = self.latest_image
+            stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
+            if self.sim_time is not None and stamp > snapshot['timestamp'] + 1e-6:
+                return
+            age = max(now - received, max(0., snapshot['timestamp'] - stamp) if self.sim_time is not None else 0.)
+            if age > 0.2:
+                return
+            if self.image_meta is None or self.image_meta['received_monotonic_s'] != received:
+                try:
+                    pixels = self.bridge.imgmsg_to_cv2(message, desired_encoding='rgb8')
+                    path = self.image_directory / f'{self.sequence:09d}.jpg'
+                    PILImage.fromarray(pixels).save(path, quality=90)
+                    self.image_meta = {"path": str(path), "timestamp": stamp,
+                                       "received_monotonic_s": received, "frame_id": message.header.frame_id,
+                                       "calibration": self.camera_info, "topic": self.topics['image']}
+                except (ValueError, OSError, RuntimeError, CvBridgeError) as error:
+                    self.get_logger().error(f"cannot store frontal image: {error}")
+                    return
+            snapshot['front_camera'] = {**self.image_meta, "age_s": age, "valid": True}
 
         def on_actuator_suction(self, index: int, message: Any) -> None:
             self.assembler.update_actuator_suction(index, message.data, received_at=time.monotonic())
@@ -757,6 +814,8 @@ def _run_ros(
             )
 
         def on_timer(self) -> None:
+            if not self.telemetry_ready:
+                return
             now = time.monotonic()
             timestamp = self.sim_time if self.sim_time is not None else now - self.started_at
             timestamp = max(self.last_timestamp, float(timestamp))
@@ -793,16 +852,25 @@ def _run_ros(
                     "/clock has not advanced recently; match countdown is paused until clock updates resume"
                 )
                 self.warned_stale_clock = True
+            snapshot["active_operation"] = self.active_operation
+            snapshot["last_action_result"] = self.last_action_result
+            self.attach_image(snapshot, now)
             self.sequence += 1
             print(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"), allow_nan=False), flush=True)
 
     rclpy.init()
-    node = WorldObserverNode()
+    node = None
     try:
+        node = WorldObserverNode()
+        from .command_telemetry import require_command_events
+        require_command_events(node, args.command_event_nodes)
+        node.telemetry_ready = True
         rclpy.spin(node)
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def main() -> None:
@@ -814,6 +882,10 @@ def main() -> None:
         choices=("gazebo_sim", "external_camera"),
         help="explicit carton pose provider; external_camera is not connected yet",
     )
+    parser.add_argument("--command-event-nodes", nargs="+", default=["/robot_control", "/ventouse_service"],
+                        help="servers required to publish command telemetry")
+    parser.add_argument("--topics-config", help="JSON mapping of authorized ROS roles to topics")
+    parser.add_argument("--image-directory", help="persistent frontal JPEG directory")
     parser.add_argument("--map-config", default=str(DEFAULT_MAP))
     parser.add_argument("--robot-id", default="robot_omni")
     parser.add_argument("--publish-hz", type=float, default=10.0)

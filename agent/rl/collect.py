@@ -70,6 +70,8 @@ def main() -> None:
                             args.opponent_id: opponent.robot_margin_m},
             pose_freshness_s={args.robot_id: policy.pose_freshness_s,
                               args.opponent_id: opponent.pose_freshness_s},
+            speed_linear_limit={args.robot_id: policy.speed_linear_limit, args.opponent_id: opponent.speed_linear_limit},
+            speed_angular_limit={args.robot_id: policy.speed_angular_limit, args.opponent_id: opponent.speed_angular_limit},
             action_rewarder=None if args.record_only else assign_action_points,
             terminal_rewarder=None if args.record_only else assign_winner_points,
         )
@@ -80,8 +82,8 @@ def main() -> None:
                 actions = (policy.decide(before[args.robot_id], deterministic=False),
                            opponent.decide(before[args.opponent_id], deterministic=False))
                 _, _, _, _, info = env.step(*actions)
-            print(json.dumps({"episode": episode + 1, "winner_id": info["winner_id"],
-                              "rewards_pending": info["rewards_pending"], "records_path": info["records_path"]}), flush=True)
+            print(f"Épisode {episode + 1}/{args.episodes} | gagnant : {info['winner_id']} | "
+                  f"récompenses en attente : {info['rewards_pending']} | {info['records_path']}", flush=True)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, ImportError, AttributeError) as error:
         print(f"collect: {error}", file=sys.stderr)
         raise SystemExit(2) from error

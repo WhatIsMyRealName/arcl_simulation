@@ -12,7 +12,7 @@ MIN_MOVE_DISTANCE_M = 1e-4
 ACTIONS = (
     "IDLE", "CANCEL", "MOVE", "SUCTION_1_ON", "SUCTION_2_ON", "SUCTION_3_ON",
     "SUCTION_1_OFF", "SUCTION_2_OFF", "SUCTION_3_OFF", "TOGGLE_WRIST",
-    "SUCTION_ALL_ON", "SUCTION_ALL_OFF",
+    "SUCTION_ALL_ON", "SUCTION_ALL_OFF", "SPEED",
 )
 
 
@@ -61,6 +61,8 @@ def action_mask(world: dict[str, Any], pose_freshness_s: float = DEFAULT_POSE_FR
     mask = [operation_allows(action, world) for action in ACTIONS]
     if not pose_available(world, pose_freshness_s):
         mask[ACTIONS.index("MOVE")] = False
+    if not image_available(world):
+        mask[ACTIONS.index("SPEED")] = False
     if not wrist_available(world):
         mask[ACTIONS.index("TOGGLE_WRIST")] = False
     if not any(mask):
@@ -109,3 +111,24 @@ def _number(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return result if math.isfinite(result) else default
+
+
+def image_available(world: dict[str, Any]) -> bool:
+    image = world.get("front_camera") or {}
+    age = _number(image.get("age_s"), math.inf)
+    return bool(image.get("path")) and 0.0 <= age <= 0.2 and image.get("valid", True) is True
+
+
+def validate_speed(world: dict[str, Any], speed: Any, linear_limit: float = 0.25,
+                   angular_limit: float = 1.0) -> dict[str, float]:
+    if not image_available(world):
+        raise ValueError("SPEED requires a frontal image no older than 200 ms")
+    if not isinstance(speed, dict):
+        raise ValueError("SPEED requires target_speed")
+    values = {key: _number(speed.get(key), math.nan) for key in ("vx", "vy", "omega")}
+    if any(not math.isfinite(v) or abs(v) > (angular_limit if k == "omega" else linear_limit) + 1e-7
+           for k, v in values.items()):
+        raise ValueError("SPEED parameters must be finite and within configured bounds")
+    if math.hypot(values["vx"], values["vy"]) > linear_limit + 1e-7:
+        raise ValueError("SPEED translation magnitude exceeds configured bound")
+    return values

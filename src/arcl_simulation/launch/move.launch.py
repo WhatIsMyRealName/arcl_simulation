@@ -16,15 +16,9 @@ Prérequis : sudo apt install python3-tk
 """
 
 import math
-import json
-import os
 import queue
-import subprocess
-import sys
 import threading
 import time
-import copy
-from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
 
@@ -39,29 +33,6 @@ from rosidl_runtime_py.utilities import get_action
 from sensor_msgs.msg import JointState
 from std_srvs.srv import SetBool
 
-
-def _workspace_root():
-    for candidate in Path(__file__).resolve().parents:
-        if (candidate / 'agent' / 'architecture' / 'world_observer.py').is_file():
-            return candidate
-    candidate = Path.cwd().resolve()
-    if (candidate / 'agent' / 'architecture' / 'world_observer.py').is_file():
-        return candidate
-    return None
-
-
-WORKSPACE_ROOT = _workspace_root()
-if WORKSPACE_ROOT is not None and str(WORKSPACE_ROOT) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE_ROOT))
-try:
-    from agent.architecture.demonstrations import DemonstrationRecorder, operator_choice_to_decision
-    from agent.architecture.actions import ACTIONS as POLICY_ACTIONS
-    from agent.architecture.targets import DEFAULT_TARGET_DATASET_PATH
-except ImportError:
-    DemonstrationRecorder = None
-    operator_choice_to_decision = None
-    POLICY_ACTIONS = ()
-    DEFAULT_TARGET_DATASET_PATH = Path('runs/targets.jsonl')
 
 try:
     from tf2_ros import Buffer, TransformListener
@@ -203,7 +174,6 @@ class Pont(Node):
                 self.sortie.put(('action_fin', cle, 'rejected', f'{libelle} : refusé par le serveur'))
                 return
             self.goals[cle] = gh
-            self.sortie.put(('action_started', cle))
             self.sortie.put(('info', f'{libelle} : accepté'))
             if cle in self.annulation_demandee:
                 gh.cancel_goal_async()
@@ -261,86 +231,6 @@ class Pont(Node):
         self.sortie.put(('joints', pos.get('ascenseur_joint'), pos.get('poignet_joint')))
 
 
-class FluxObservations:
-    """Run the canonical agent observer and forward its JSON snapshots to Tk."""
-
-    def __init__(self, sortie, workspace_root):
-        self.sortie = sortie
-        self.workspace_root = workspace_root
-        self.process = None
-        self.threads = []
-        self.stopping = threading.Event()
-
-    def start(self):
-        if self.process is not None:
-            return
-        if self.workspace_root is None:
-            raise RuntimeError('racine du dépôt contenant agent/ introuvable')
-        environment = os.environ.copy()
-        current_path = environment.get('PYTHONPATH', '')
-        environment['PYTHONPATH'] = str(self.workspace_root) + (
-            os.pathsep + current_path if current_path else ''
-        )
-        self.process = subprocess.Popen(
-            [sys.executable, '-m', 'agent.architecture.world_observer',
-             '--carton-source', 'gazebo_sim', '--publish-hz', '10'],
-            cwd=self.workspace_root,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            bufsize=1,
-        )
-        self.threads = [
-            threading.Thread(target=self._read_snapshots, daemon=True),
-            threading.Thread(target=self._read_errors, daemon=True),
-        ]
-        for thread in self.threads:
-            thread.start()
-
-    def _read_snapshots(self):
-        if self.process is None or self.process.stdout is None:
-            return
-        for line in self.process.stdout:
-            try:
-                observation = json.loads(line)
-            except json.JSONDecodeError:
-                self.sortie.put(('observer_error', 'snapshot JSON invalide'))
-                continue
-            if isinstance(observation, dict):
-                self.sortie.put(('snapshot', observation))
-        if not self.stopping.is_set():
-            code = self.process.poll()
-            self.sortie.put(('observer_stopped', code))
-
-    def _read_errors(self):
-        if self.process is None or self.process.stderr is None:
-            return
-        for line in self.process.stderr:
-            message = line.strip()
-            if message:
-                self.sortie.put(('observer_info', message))
-
-    def stop(self):
-        if self.process is None:
-            return
-        self.stopping.set()
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=2.0)
-        for thread in self.threads:
-            thread.join(timeout=1.0)
-        self.process = None
-        self.threads = []
-
-
 def appliquer_style(racine):
     s = ttk.Style(racine)
     if 'clam' in s.theme_names():
@@ -380,18 +270,6 @@ class Interface:
         self.cible_pose = None        # dernière cible envoyée
         self.saisie = None            # cible en cours de saisie à la souris
         self.appui_px = (0, 0)
-        self.observation_stream = None
-        self.latest_observation = None
-        self.latest_observation_at = None
-        self.recording_starting = False
-        self.recorder = None
-        self.decision_recorders = {}
-        self.operation_decision_id = None
-        self.cancel_decision_id = None
-        self.demo_active_operation = None
-        self.demo_last_result = None
-        self.demo_idle_timer = None
-
         racine.title('Pupitre robot_omni')
         racine.minsize(1000, 0)
         appliquer_style(racine)
@@ -409,17 +287,6 @@ class Interface:
         bandeau.columnconfigure(0, weight=1)
         ttk.Label(bandeau, text='Pupitre robot_omni', style='Titre.TLabel').grid(
             row=0, column=0, sticky='w')
-        self.btn_start_recording = ttk.Button(
-            bandeau, text='Enregistrer une démonstration', command=self.start_recording
-        )
-        self.btn_start_recording.grid(row=0, column=1, padx=(8, 4))
-        self.btn_stop_recording = ttk.Button(
-            bandeau, text='Arrêter', command=self.stop_recording, state='disabled'
-        )
-        self.btn_stop_recording.grid(row=0, column=2, padx=(0, 8))
-        self.lbl_recording = ttk.Label(bandeau, text='Enregistrement désactivé', style='Doux.TLabel')
-        self.lbl_recording.grid(row=0, column=3, sticky='e')
-
         gauche = ttk.Frame(cadre)
         gauche.grid(row=1, column=0, sticky='nsew', padx=(0, 8))
         droite = ttk.Frame(cadre)
@@ -451,148 +318,6 @@ class Interface:
         racine.protocol('WM_DELETE_WINDOW', self.fermer)
         self.racine.after(50, self.lire_file)
         self.racine.after(500, self.verifier_services)
-
-    def start_recording(self):
-        if DemonstrationRecorder is None or operator_choice_to_decision is None:
-            self.ecrire('Enregistrement indisponible : module agent introuvable', 'erreur')
-            return
-        if self.recording_starting or self.recorder is not None:
-            return
-        try:
-            self.observation_stream = FluxObservations(self.file, WORKSPACE_ROOT)
-            self.observation_stream.start()
-        except (OSError, RuntimeError) as error:
-            self.observation_stream = None
-            self.ecrire(f'Impossible de démarrer l’observateur : {error}', 'erreur')
-            return
-        self.recording_starting = True
-        self.btn_start_recording.state(['disabled'])
-        self.lbl_recording.configure(text='Attente du premier snapshot ROS…', foreground=C['doux'])
-
-    def stop_recording(self, reason='operator stopped recording'):
-        self.recording_starting = False
-        if self.recorder is not None:
-            recorder = self.recorder
-            recorder.stop(reason=reason)
-            if recorder.pending_results:
-                self.ecrire(
-                    'Enregistrement arrêté ; le fichier sera publié après la fin de l’ordre actif.',
-                    'info',
-                )
-            elif recorder.published_samples:
-                self.ecrire(
-                    f'{recorder.published_samples} exemple(s) ajouté(s) à {recorder.path}', 'info'
-                )
-            else:
-                self.ecrire('Aucun exemple à exporter.', 'info')
-            self.recorder = None
-        if self.demo_idle_timer is not None:
-            self.racine.after_cancel(self.demo_idle_timer)
-            self.demo_idle_timer = None
-        if self.observation_stream is not None:
-            self.observation_stream.stop()
-            self.observation_stream = None
-        self.btn_start_recording.state(['!disabled'])
-        self.btn_stop_recording.state(['disabled'])
-        self.lbl_recording.configure(text='Enregistrement désactivé', foreground=C['doux'])
-
-    def _activate_recorder(self):
-        if not self.recording_starting or self.latest_observation is None:
-            return
-        destination = WORKSPACE_ROOT / DEFAULT_TARGET_DATASET_PATH
-        try:
-            self.recorder = DemonstrationRecorder(destination)
-        except OSError as error:
-            self.recording_starting = False
-            if self.observation_stream is not None:
-                self.observation_stream.stop()
-                self.observation_stream = None
-            self.btn_start_recording.state(['!disabled'])
-            self.lbl_recording.configure(text='Échec de création du fichier', foreground=C['erreur'])
-            self.ecrire(f'Impossible de créer la session de démonstration : {error}', 'erreur')
-            return
-        self.recording_starting = False
-        self.btn_stop_recording.state(['!disabled'])
-        self.lbl_recording.configure(
-            text=f'Enregistrement : {self.recorder.session_id[:8]}', foreground=C['ok']
-        )
-        self.ecrire(f'Session de démonstration démarrée : {self.recorder.path}', 'ok')
-        self._schedule_demo_idle()
-
-    def _observation_for_decision(self):
-        if self.latest_observation is None:
-            return None
-        observation = copy.deepcopy(self.latest_observation)
-        observation['active_operation'] = copy.deepcopy(self.demo_active_operation)
-        observation['last_action_result'] = copy.deepcopy(self.demo_last_result)
-        return observation
-
-    def _record_choice(self, command, parameters, *, requires_result=True):
-        if self.recorder is None:
-            return None, None
-        observation = self._observation_for_decision()
-        if observation is None:
-            self.ecrire('Choix non exporté : aucun snapshot agent disponible', 'erreur')
-            return None, None
-        decision = operator_choice_to_decision(command, parameters, observation)
-        if decision.get('action') not in POLICY_ACTIONS:
-            return None, decision
-        decision['world_sequence'] = int(observation.get('sequence', -1))
-        decision['world_timestamp'] = observation.get('timestamp')
-        decision_id = self.recorder.record_decision(
-            observation, decision, command=command, parameters=parameters,
-            requires_result=requires_result,
-        )
-        if requires_result:
-            self.decision_recorders[decision_id] = self.recorder
-        return decision_id, decision
-
-    def _operator_decision(self, command, parameters):
-        if operator_choice_to_decision is None:
-            return {'action': 'UNSUPPORTED'}
-        observation = self._observation_for_decision() or {'robot': {}}
-        return operator_choice_to_decision(command, parameters, observation)
-
-    def _record_result(self, decision_id, action, status, reason):
-        recorder = self.decision_recorders.pop(decision_id, None) if decision_id is not None else None
-        if recorder is not None:
-            recorded = recorder.record_result(decision_id, {
-                'action': action, 'status': status, 'failed': status in ('failed', 'rejected'),
-                'reason': reason,
-            })
-            if recorded and recorder.path.exists():
-                self.ecrire(f'Fichier d’entraînement enregistré : {recorder.path}', 'info')
-        self.demo_last_result = {
-            'id': decision_id, 'type': action, 'status': status,
-            'failed': status in ('failed', 'rejected'), 'cancelable': False,
-            'target_pose': copy.deepcopy(
-                (self.demo_active_operation or {}).get('target_pose')
-            ),
-        }
-
-    def _schedule_demo_idle(self):
-        if self.recorder is not None and self.demo_idle_timer is None:
-            self.demo_idle_timer = self.racine.after(100, self._record_implicit_idle)
-
-    def _record_implicit_idle(self):
-        self.demo_idle_timer = None
-        if self.recorder is None:
-            return
-        if (self.demo_active_operation is not None
-                and self.demo_active_operation.get('type') != 'UNSUPPORTED_ROCK_CENTERING'):
-            self._record_choice('idle', {}, requires_result=False)
-        self._schedule_demo_idle()
-
-    def _receive_observation(self, observation):
-        self.latest_observation = observation
-        self.latest_observation_at = time.monotonic()
-        if self.pose_robot is None:
-            robot = observation.get('robot') if isinstance(observation.get('robot'), dict) else {}
-            pose = robot.get('pose') if isinstance(robot.get('pose'), dict) else None
-            if pose is not None:
-                self.pose_robot = (pose.get('x'), pose.get('y'), pose.get('yaw'))
-        if self.recording_starting:
-            self._activate_recorder()
 
     # ------------------------------------------------------------------ construction
     def construire_prehension(self, parent):
@@ -771,24 +496,6 @@ class Interface:
             self.ecrire('Attends la fin de l’opération en cours avant de commander la préhension', 'erreur')
             return
         self.en_cours = libelle
-        if cle == 'poignet':
-            command = 'wrist'
-            parameters = {'target_angle_rad': math.pi / 2.0 if valeur else 0.0}
-        else:
-            command = 'suction'
-            parameters = {
-                'group': 'all' if cle == 'tous' else int(cle.removeprefix('etage_')),
-                'enabled': bool(valeur),
-            }
-        decision_id, decision = self._record_choice(command, parameters)
-        if decision is None:
-            decision = self._operator_decision(command, parameters)
-        self.operation_decision_id = decision_id
-        self.demo_active_operation = {
-            'id': decision_id or f'manual-{time.monotonic_ns()}',
-            'type': decision['action'], 'status': 'running', 'cancelable': False,
-            'failed': False, 'target_pose': None,
-        }
         for b in self.boutons:
             b.state(['disabled'])
         self.ecrire(f'{libelle}…', 'info')
@@ -940,22 +647,6 @@ class Interface:
             self.ecrire('Attends la fin de l’opération en cours avant de déplacer le robot', 'erreur')
             return
         self.action_en_cours = cle
-        if cle == 'go_to_pose':
-            command = 'move'
-            parameters = dict(champs)
-        else:
-            command = 'rock_centering'
-            parameters = {}
-        decision_id, decision = self._record_choice(command, parameters)
-        if decision is None:
-            decision = self._operator_decision(command, parameters)
-        self.operation_decision_id = decision_id
-        self.demo_active_operation = {
-            'id': decision_id or f'manual-{time.monotonic_ns()}',
-            'type': decision['action'], 'status': 'issuing',
-            'cancelable': cle == 'go_to_pose', 'failed': False,
-            'target_pose': decision.get('target_pose'),
-        }
         self.btn_aller.state(['disabled'])
         self.btn_centrer.state(['disabled'])
         self.annulers[cle].state(['!disabled'])
@@ -976,27 +667,11 @@ class Interface:
             self.but_en_attente = None
         if self.action_en_cours != cle:
             return
-        operation_type = 'MOVE' if cle == 'go_to_pose' else 'ROCK_CENTERING'
-        cancel_id, _ = self._record_choice('cancel', {'operation_type': operation_type})
-        self.cancel_decision_id = cancel_id
-        if self.demo_active_operation is not None:
-            self.demo_active_operation['status'] = 'canceling'
-            self.demo_active_operation['cancelable'] = False
         self.annulers[cle].state(['disabled'])
         self.ecrire('Annulation demandée…', 'info')
         self.pont.annuler(cle)
 
     def fin_action(self, cle, status, texte):
-        action = (self.demo_active_operation or {}).get(
-            'type', 'MOVE' if cle == 'go_to_pose' else 'UNSUPPORTED_ROCK_CENTERING'
-        )
-        self._record_result(self.operation_decision_id, action, status, texte)
-        if self.cancel_decision_id is not None:
-            cancel_status = 'succeeded' if status == 'canceled' else 'failed'
-            self._record_result(self.cancel_decision_id, 'CANCEL', cancel_status, texte)
-        self.operation_decision_id = None
-        self.cancel_decision_id = None
-        self.demo_active_operation = None
         ok = status == 'succeeded'
         self.ecrire(texte, 'ok' if ok else 'erreur')
         self.action_en_cours = None
@@ -1041,10 +716,6 @@ class Interface:
                 evt = self.file.get_nowait()
                 if evt[0] == 'fin':
                     _, _, status, texte = evt
-                    action = (self.demo_active_operation or {}).get('type', 'UNKNOWN')
-                    self._record_result(self.operation_decision_id, action, status, texte)
-                    self.operation_decision_id = None
-                    self.demo_active_operation = None
                     ok = status == 'succeeded'
                     self.ecrire(texte, 'ok' if ok else 'erreur')
                     self.en_cours = None
@@ -1061,24 +732,8 @@ class Interface:
                 elif evt[0] == 'action_fin':
                     _, cle, status, texte = evt
                     self.fin_action(cle, status, texte)
-                elif evt[0] == 'action_started':
-                    if (self.action_en_cours == evt[1] and self.demo_active_operation is not None
-                            and self.demo_active_operation.get('status') == 'issuing'):
-                        self.demo_active_operation['status'] = 'running'
                 elif evt[0] == 'info':
                     self.ecrire(evt[1], 'info')
-                elif evt[0] == 'snapshot':
-                    self._receive_observation(evt[1])
-                elif evt[0] == 'observer_info':
-                    self.ecrire(evt[1], 'info')
-                elif evt[0] == 'observer_error':
-                    self.ecrire(f'Observateur : {evt[1]}', 'erreur')
-                elif evt[0] == 'observer_stopped':
-                    if self.recording_starting:
-                        self.recording_starting = False
-                        self.btn_start_recording.state(['!disabled'])
-                        self.lbl_recording.configure(text='Observateur arrêté', foreground=C['erreur'])
-                    self.ecrire(f'Observateur terminé (code {evt[1]})', 'erreur')
                 elif evt[0] == 'pose':
                     _, x, y, lacet = evt
                     self.pose_robot = (x, y, lacet)
@@ -1100,10 +755,6 @@ class Interface:
 
     def fermer(self):
         """Annule les actions en cours avant de fermer, pour ne pas laisser la base partir seule."""
-        self.stop_recording(reason='operator console closed')
-        for recorder in set(self.decision_recorders.values()):
-            recorder.abort_pending(reason='operator console closed before a terminal result')
-        self.decision_recorders.clear()
         if self.pont.annuler_tout():
             self.ecrire('Fermeture : annulation des actions en cours…', 'info')
             self.racine.after(400, self.racine.destroy)

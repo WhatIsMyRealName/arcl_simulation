@@ -12,7 +12,7 @@ from typing import Any, Iterator, Sequence
 from .actions import ACTIONS
 
 
-TARGET_DATASET_FORMAT = "arcl-agent-targets-v1"
+TARGET_DATASET_FORMAT = "arcl-agent-targets"
 DEFAULT_SELFPLAY_STEP_SIZE = 0.1
 DEFAULT_TARGET_DATASET_PATH = Path("runs/targets.jsonl")
 

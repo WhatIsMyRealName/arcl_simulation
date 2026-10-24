@@ -7,6 +7,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch.actions import ExecuteProcess
 
 
@@ -20,7 +21,7 @@ def generate_launch_description():
 
     gz = IncludeLaunchDescription(PythonLaunchDescriptionSource(
         os.path.join(get_package_share_directory('ros_gz_sim'), 'launch', 'gz_sim.launch.py')),
-        launch_arguments={'gz_args': f'-r {world}'}.items()
+        launch_arguments={'gz_args': [LaunchConfiguration('gz_flags'), ' ', world]}.items()
     )
 
     bridge = Node(
@@ -48,7 +49,8 @@ def generate_launch_description():
 
     robot_control = Node(
         package=pkg_name,
-        executable="robot_control"
+        executable="robot_control",
+        parameters=[{'use_sim_time': True, 'publish_command_events': ParameterValue(LaunchConfiguration('command_events'), value_type=bool)}]
     )
 
     # Localisation : odométrie roues + OTOS -> ekf_node (robot_localization) -> recalage balises
@@ -80,7 +82,8 @@ def generate_launch_description():
 
     rock_centering = Node(
         package=pkg_name,
-        executable="rock_centering"
+        executable="rock_centering",
+        parameters=[{'use_sim_time': True}]
     )
 
     table_markers = Node(
@@ -91,6 +94,7 @@ def generate_launch_description():
     ventouse_service = Node(
         package=pkg_name,
         executable='ventouse_service',
+        parameters=[{'use_sim_time': True, 'publish_command_events': ParameterValue(LaunchConfiguration('command_events'), value_type=bool)}],
         output='screen'
     )
     
@@ -109,11 +113,15 @@ def generate_launch_description():
 
     command_interface = ExecuteProcess(
         cmd=['python3', os.path.join(pkg, 'launch', 'move.launch.py')],
+        condition=IfCondition(LaunchConfiguration('pupitre')),
         output='screen',
     )
 
     return LaunchDescription([
         DeclareLaunchArgument('rviz', default_value='true'),
+        DeclareLaunchArgument('command_events', default_value='false'),
+        DeclareLaunchArgument('gz_flags', default_value='-r'),
+        DeclareLaunchArgument('pupitre', default_value='true'),
         AppendEnvironmentVariable('GZ_SIM_RESOURCE_PATH', os.path.join(pkg, 'worlds')),
         AppendEnvironmentVariable('GZ_SIM_RESOURCE_PATH',os.path.join(pkg, 'models')),
         gz, bridge, rsp, rviz, 
